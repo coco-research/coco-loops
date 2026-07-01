@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from coco_loops.cli import main
+from coco_loops import lifetime
 from coco_loops.paths import reset_config
 
 
@@ -79,6 +80,22 @@ class TestCliList:
         assert "running" in out
 
 
+class TestCliStart:
+    def test_start_arms_lifetime_and_clears_kill_switch(self, cli_env, capsys):
+        loop_id = "synthetic-loop"
+        _write_contract(cli_env["loops_dir"], loop_id)
+        (cli_env["runtime_dir"] / f"{loop_id}.disabled").write_text("", encoding="utf-8")
+
+        rc = main(["start", loop_id, "--for", "1h"])
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert f"armed {loop_id} for 1h (kill-switch cleared)" in out
+        assert lifetime.used_seconds(loop_id, state_dir=cli_env["runtime_dir"]) == 0
+        assert lifetime.cap_seconds(loop_id, state_dir=cli_env["runtime_dir"]) == 3600
+        assert not (cli_env["runtime_dir"] / f"{loop_id}.disabled").exists()
+
+
 class TestCliStatus:
     def test_status_reports_run_log_and_budget(self, cli_env, capsys):
         _write_contract(cli_env["loops_dir"], "synthetic-loop")
@@ -102,6 +119,27 @@ class TestCliStatus:
 
         assert rc == 0
         assert "no entries yet" in out
+
+    def test_status_shows_lifetime_line(self, cli_env, capsys):
+        loop_id = "synthetic-loop"
+        _write_contract(cli_env["loops_dir"], loop_id)
+        lifetime.arm(loop_id, 3600, state_dir=cli_env["runtime_dir"])
+        lifetime.tick(loop_id, 600, state_dir=cli_env["runtime_dir"])
+
+        rc = main(["status", loop_id])
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "Lifetime: 10m of 1h used (50m left)" in out
+
+    def test_status_shows_unbounded_lifetime(self, cli_env, capsys):
+        _write_contract(cli_env["loops_dir"], "synthetic-loop")
+
+        rc = main(["status", "synthetic-loop"])
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "Lifetime: unbounded" in out
 
 
 class TestCliPromote:

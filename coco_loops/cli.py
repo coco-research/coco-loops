@@ -18,6 +18,7 @@ from coco_loops.budget import (
     summarize_coding_loop_spend,
     summarize_loop_spend,
 )
+from coco_loops import lifetime
 from coco_loops.paths import (
     configure,
     global_pause_path,
@@ -136,6 +137,37 @@ def cmd_list(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_lifetime_status(loop_id: str) -> None:
+    cap = lifetime.cap_seconds(loop_id)
+    if cap is None:
+        print("Lifetime: unbounded")
+        return
+    used = lifetime.used_seconds(loop_id)
+    left = lifetime.remaining(loop_id)
+    assert left is not None
+    print(
+        f"Lifetime: {lifetime.fmt_duration(used)} of {lifetime.fmt_duration(cap)} used "
+        f"({lifetime.fmt_duration(left)} left)"
+    )
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    loop_id = args.loop
+    duration_text = args.for_duration or "4h"
+    try:
+        cap_seconds = lifetime.parse_duration(duration_text)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    lifetime.arm(loop_id, cap_seconds)
+    disabled = kill_switch_path(loop_id)
+    if disabled.exists():
+        disabled.unlink()
+    print(f"armed {loop_id} for {duration_text} (kill-switch cleared)")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     loop_id = args.loop
     known = {item["loop_id"] for item in discover_loops()}
@@ -182,6 +214,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                     print(f"    action: {action}")
             for escalation in entry.escalations:
                 print(f"    escalation: {escalation}")
+
+    _print_lifetime_status(loop_id)
 
     caps = loop_caps(loop_id)
     spend = summarize_loop_spend(log_path, loop_id)
@@ -262,6 +296,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list", help="List loop contracts, levels, and pause state")
 
+    start_p = sub.add_parser("start", help="Arm a loop lifetime cap and clear kill-switch")
+    start_p.add_argument("loop", help="Loop id, e.g. coding-loop")
+    start_p.add_argument(
+        "--for",
+        dest="for_duration",
+        default=None,
+        metavar="DURATION",
+        help="Active-work lifetime cap (default: 4h), e.g. 90s, 45m, 6h, 1h30m",
+    )
+
     status_p = sub.add_parser("status", help="Recent run-log + budget for a loop")
     status_p.add_argument("loop", help="Loop id, e.g. coding-loop")
 
@@ -285,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     configure(loops_dir=args.loops_dir, state_dir=args.state_dir)
     handlers = {
         "list": cmd_list,
+        "start": cmd_start,
         "status": cmd_status,
         "promote": cmd_promote,
         "verify": cmd_verify,
