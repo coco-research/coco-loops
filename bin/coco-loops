@@ -1,0 +1,4 @@
+#!/bin/zsh
+set -euo pipefail
+
+exec coco-loops "$@"

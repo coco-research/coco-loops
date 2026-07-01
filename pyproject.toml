@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coco-loops"
+version = "1.0.0"
+description = "Principle-governed self-evolving loop orchestration framework (stdlib only)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+coco-loops = "coco_loops.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["coco_loops*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

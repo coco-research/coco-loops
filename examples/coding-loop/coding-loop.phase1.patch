@@ -1,0 +1,571 @@
+--- coding-loop.py	2026-06-30 18:40:46
++++ coding-loop.py	2026-06-30 19:39:09
+@@ -7,27 +7,54 @@
+ Local qwen3-coder (call_llm / TOOLS below) is retained for imports and background
+ work only — no longer used in the fix path.
+ 
+-Architecture: task → cursor-agent edit → tsc gate → test/baseline gate → scoped commit.
+-Kill: touch ~/.coco/coding-loop.disabled
++Architecture: task → cursor-agent edit → separate verifier (A) → scoped commit.
++L1: PROPOSE_ONLY writes diff to run-log/M0 without commit. Kill: ~/.coco/coding-loop.disabled
+ """
+ import json, os, re, subprocess, sys, time, glob as _glob
+ import urllib.request
+ from pathlib import Path
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ sys.path.insert(0, str(Path.home() / ".coco"))
+ import scheduler_gate as sg
+ 
+ HOME = Path.home()
++REPO_EARLY = HOME / "projects" / "coco-steal"
++sys.path.insert(0, str(REPO_EARLY / "backend"))
++from app.loops.budget import BudgetStatus, check_cycle_budget
++from app.loops.verifier import Verdict, verify_proposal
++
++HOME = Path.home()
+ DISABLED = HOME / ".coco" / "coding-loop.disabled"
++PROPOSE_ONLY_FLAG = HOME / ".coco" / "coding-loop.propose-only"
++RUN_LOG = HOME / ".coco" / "loop-run-log.jsonl"
++PROPOSED_FILE = HOME / ".coco" / "coding-loop-proposed.json"
++ESCALATED_FILE = HOME / ".coco" / "coding-loop-escalated.json"
++CONSTRAINTS_FILE = REPO_EARLY / "loops" / "loop-constraints.md"
+ LOG = HOME / ".coco" / "logs" / "coding-loop.log"
+ LLM_EP = "http://127.0.0.1:1234/v1/chat/completions"
+ MODEL = "qwen3-coder-30b-a3b-instruct"
+-REPO = HOME / "projects" / "coco-steal"
++REPO = REPO_EARLY
+ FE = REPO / "frontend" / "src"
+ BE = REPO / "backend" / "app"
+ MAX_TURNS = 8  # max tool-use turns per task
+ 
++OUTCOME_SUCCESS = "success"
++OUTCOME_FAIL = "fail"
++OUTCOME_PROPOSE_ONLY = "propose_only"
++EMPTY_WATCHLIST_TOKEN_BUDGET = 5000
++
++
++_FORCE_PROPOSE_ONLY = False
++
++
++def is_propose_only_mode() -> bool:
++    if _FORCE_PROPOSE_ONLY:
++        return True
++    env = os.environ.get("CODING_LOOP_PROPOSE_ONLY", "").lower()
++    return env in ("1", "true", "yes") or PROPOSE_ONLY_FLAG.exists()
++
++
+ def ts(): return datetime.now().strftime("%H:%M:%S")
+ def log(m):
+     line=f"[{ts()}] {m}"; print(line,flush=True)
+@@ -203,17 +230,166 @@
+     return False
+ 
+ 
+-def run_task_agentic(task: dict) -> bool:
++def _append_run_log(entry: dict):
++    """Append schema-compliant entry; preserves optional extensions for cli status."""
++    from app.loops.run_log import RunLogEntry
++
++    now = datetime.now(timezone.utc).isoformat()
++    record = {
++        "run_id": entry.get("run_id") or f"coding-loop-{now}",
++        "loop_id": entry.get("loop_id") or entry.get("loop") or "coding-loop",
++        "timestamp": entry.get("timestamp") or now,
++        "items_found": int(entry.get("items_found", 0)),
++        "actions_taken": list(entry.get("actions_taken") or []),
++        "escalations": list(entry.get("escalations") or []),
++        "tokens_estimate": int(entry.get("tokens_estimate", EMPTY_WATCHLIST_TOKEN_BUDGET)),
++        "outcome": str(entry.get("outcome", "no-op")),
++        "human_verdict": entry.get("human_verdict"),
++        "last_progress": entry.get("last_progress") or now,
++    }
++    for key in (
++        "task_id", "files_changed", "diff_summary", "verifier_reasoning",
++        "verifier_verdict", "reason", "diagnostic",
++    ):
++        if key in entry:
++            record[key] = entry[key]
++    try:
++        RunLogEntry.from_dict(record)
++        RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
++        with RUN_LOG.open("a", encoding="utf-8") as fh:
++            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
++    except Exception as e:
++        log(f"  (run-log append skip: {e})")
++
++
++def _write_m0_proposal(task: dict, diff_text: str, reasoning: str):
++    """Best-effort M0 checkpoint for a propose-only cycle."""
++    try:
++        body = json.dumps({
++            "project": "coco-steal",
++            "kind": "loop_proposal",
++            "text": (
++                f"PROPOSE_ONLY #{task.get('id')}: {task.get('name', '')}\n"
++                f"Reasoning: {reasoning[:800]}\n"
++                f"Diff (head):\n{diff_text[:2000]}"
++            ),
++            "next_step": f"Human review proposal for #{task.get('id')}",
++            "source_tool": "coding-loop",
++        }).encode()
++        req = urllib.request.Request(
++            "http://localhost:8001/api/brain/checkpoint",
++            data=body,
++            headers={"Content-Type": "application/json"},
++            method="POST",
++        )
++        with urllib.request.urlopen(req, timeout=8) as r:
++            r.read()
++    except Exception as e:
++        log(f"  (M0 proposal checkpoint skip: {e})")
++
++
++def load_constraints_preflight() -> list[str]:
++    """T3: read loop-constraints.md and return active rule lines."""
++    path = CONSTRAINTS_FILE
++    if not path.exists():
++        log(f"constraints: {path} missing — using empty denylist")
++        return []
++    rules = []
++    for line in path.read_text(errors="replace").splitlines():
++        s = line.strip()
++        if s.startswith("- ") or s.startswith("* "):
++            rules.append(s[2:].strip())
++    log(f"constraints loaded: {len(rules)} rules")
++    return rules
++
++
++def _capture_diff() -> str:
++    return run_bash("git diff --no-color HEAD 2>/dev/null | head -400")
++
++
++def _git_untracked_new(before_dirty: set[str]) -> list[str]:
++    """Repo-relative paths of untracked files that appeared after before_dirty."""
++    raw = run_bash("git status --porcelain")
++    new_untracked: list[str] = []
++    for line in raw.splitlines():
++        if line.startswith("exit="):
++            continue
++        line = line.rstrip()
++        if not line.startswith("??"):
++            continue
++        rel = line[3:].strip()
++        if rel and rel not in before_dirty:
++            new_untracked.append(rel)
++    return new_untracked
++
++
++def _revert_working_tree(before_dirty: set[str]):
++    """Restore tracked edits and remove untracked files the maker created."""
++    run_bash("git restore .")
++    for rel in _git_untracked_new(before_dirty):
++        target = REPO / rel
++        if target.is_dir():
++            import shutil
++            shutil.rmtree(target, ignore_errors=True)
++        elif target.exists():
++            target.unlink(missing_ok=True)
++        log(f"  reverted untracked: {rel}")
++
++
++def _record_proposal(
++    task: dict,
++    files_changed: list[str],
++    diff_text: str,
++    reasoning: str,
++    before_dirty: set[str],
++    diagnostic: dict | None = None,
++):
++    now = datetime.now(timezone.utc).isoformat()
++    diff_summary = diff_text[:500].replace("\n", " ") if diff_text else "(no diff)"
++    proposed = load_json_set(PROPOSED_FILE)
++    if not isinstance(proposed, dict):
++        proposed = {}
++    proposal_entry = {
++        "ts": now,
++        "name": task.get("name", ""),
++        "reasoning": reasoning[:2000],
++        "diff_head": diff_text[:4000],
++        "files_changed": files_changed,
++    }
++    if diagnostic:
++        proposal_entry["diagnostic"] = diagnostic
++    proposed[task["id"]] = proposal_entry
++    save_json_atomic(PROPOSED_FILE, proposed)
++    run_log_entry = {
++        "run_id": f"coding-loop-{task['id']}-{now}",
++        "outcome": "fix-proposed",
++        "task_id": task.get("id"),
++        "files_changed": files_changed,
++        "diff_summary": diff_summary,
++        "items_found": 1,
++        "actions_taken": [f"fix-proposed: {task.get('id')}"],
++        "human_verdict": None,
++        "last_progress": now,
++        "tokens_estimate": EMPTY_WATCHLIST_TOKEN_BUDGET,
++    }
++    if diagnostic:
++        run_log_entry["diagnostic"] = diagnostic
++    _append_run_log(run_log_entry)
++    _write_m0_proposal(task, diff_text, reasoning)
++    log("  proposal captured")
++
++
++def run_task_agentic(task: dict) -> str:
+     log(f"▶ #{task['id']}: {task['name']}")
+     touched_files: list[str] = []
+     if sg.current_policy() == "paused":
+         log("scheduler gate: paused — skipping")
+-        return False
++        return OUTCOME_FAIL
+ 
+     # Pre-check: already done by cursor-agent or recent commit?
+     if _already_done(task):
+         log(f"  ✓ #{task['id']} already fixed by cursor-agent/recent commit — marking done")
+-        return True
++        return OUTCOME_SUCCESS
+     system = (
+         "You are an expert TypeScript/Python engineer fixing bugs in the CoCo platform. "
+         f"Repo root: {REPO}. Frontend: {FE}. Backend: {BE}. "
+@@ -240,79 +416,130 @@
+             log(f"  (memory recall skip: {e})")
+     if sg.current_policy() == "paused":
+         log("scheduler gate: paused — skipping")
+-        return False
+-    touched_files = run_task_cursor(task, system, user_content)
+-    # Verify step 1: tsc
+-    log("  running tsc...")
+-    tsc = run_bash("cd frontend && npx tsc -b 2>&1 | head -20")
+-    if "exit=0" not in tsc:
+-        log(f"  ✗ tsc failed:\n{tsc[:300]}")
+-        run_bash("find frontend/src -name '*.bak' -exec sh -c 'mv \"$0\" \"${0%.bak}\"' {} \\;")
+-        return False
+-    # Verify step 2: frontend tests — fail only if NEW failures introduced
+-    log("  running frontend tests...")
+-    test_out = run_bash("cd frontend && pnpm test 2>&1 | grep 'Tests '")
+-    import re as _re
+-    m = _re.search(r"(\d+) failed", test_out)
+-    current_failures = int(m.group(1)) if m else 0
++        return OUTCOME_FAIL
++    before_dirty = _git_dirty_files()
+     try:
+-        baseline = int(open(Path.home() / "projects/coco-steal/.test-baseline-failures").read().strip())
+-    except Exception:
+-        baseline = 19  # fallback to known baseline
+-    if current_failures > baseline:
+-        log(f"  ✗ tests regressed: {current_failures} failures (baseline {baseline})")
+-        run_bash("find frontend/src -name '*.bak' -exec sh -c 'mv \"$0\" \"${0%.bak}\"' {} \\;")
+-        return False
+-    elif current_failures < baseline:
+-        # Improved — update baseline (absolute path)
+-        (Path.home() / "projects/coco-steal/.test-baseline-failures").write_text(str(current_failures))
+-        log(f"  ✓ tests improved: {current_failures} failures (was {baseline}) — baseline updated")
+-    else:
+-        log(f"  ✓ tests stable: {current_failures} failures (matches baseline)")
+-    # Clean up backups
+-    run_bash("find frontend/src backend/app -name '*.bak' -delete 2>/dev/null; echo ok")
+-    # Commit
+-    commit_msg = f"{task['id']}: {task['name'][:60]} (QB Sonnet 4.6 via cursor-agent)\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+-    import shlex as _shlex
+-    _uniq = []
+-    for _f in touched_files:
+-        if _f not in _uniq:
+-            _uniq.append(_f)
+-    if not _uniq:
+-        log(f"  ✓ #{task['id']} — no files written this task; nothing to commit")
+-        return True
+-    _add = "git add -- " + " ".join(_shlex.quote(f) for f in _uniq)
+-    r = run_bash(f'{_add} && git commit -m "{commit_msg}"')
+-    if "nothing to commit" in r or "working tree clean" in r:
+-        # Already fixed — cursor-agent or previous run committed the fix.
+-        # "nothing to commit" after agent ran + tsc passed = fix already exists.
+-        log(f"  ✓ #{task['id']} already committed (nothing new to commit) — treating as done")
+-        return True
+-    if "exit=0" in r:
+-        log(f"  ✓ committed!")
+-        # Store successful fix in agentmemory for future reuse
+-        try:
+-            import importlib.util as _ilu
+-            spec = _ilu.spec_from_file_location("fix_memory", Path.home() / ".coco/fix-memory.py")
+-            fm = _ilu.module_from_spec(spec); spec.loader.exec_module(fm)
+-            commit_hash = run_bash("git rev-parse --short HEAD").split("\n")[0].replace("exit=0\n","").strip()
+-            surface = task["id"].split("-")[0] if "-" in task["id"] else "unknown"
+-            fm.remember_fix(
+-                surface=surface,
+-                issue_summary=task.get("name",""),
+-                instruction=task.get("instruction","")[:500],
+-                commit_hash=commit_hash,
+-                target_file=task.get("id",""),
++        touched_files = run_task_cursor(task, system, user_content)
++        diff_text = _capture_diff()
++
++        # Maker diagnostics (informational in PROPOSE_ONLY; gate in commit mode)
++        # Verify step 1: tsc
++        log("  running tsc (maker diagnostic)...")
++        tsc = run_bash("cd frontend && npx tsc -b 2>&1 | head -20")
++        tsc_ok = "exit=0" in tsc
++        if not tsc_ok:
++            log(f"  ✗ tsc failed (maker diagnostic):\n{tsc[:300]}")
++            run_bash("find frontend/src -name '*.bak' -exec sh -c 'mv \"$0\" \"${0%.bak}\"' {} \\;")
++            if is_propose_only_mode():
++                log("  📋 PROPOSE_ONLY — diagnostic informational: tsc=fail")
++            else:
++                return OUTCOME_FAIL
++        log("  running frontend tests (maker diagnostic)...")
++        # Verify step 2: frontend tests — fail only if NEW failures introduced
++        test_out = run_bash("cd frontend && pnpm test 2>&1 | grep 'Tests '")
++        import re as _re
++        m = _re.search(r"(\d+) failed", test_out)
++        test_failures = int(m.group(1)) if m else 0
++        if is_propose_only_mode():
++            log(f"  📋 PROPOSE_ONLY — diagnostic informational: test_failures={test_failures}")
++        else:
++            try:
++                baseline = int(open(Path.home() / "projects/coco-steal/.test-baseline-failures").read().strip())
++            except Exception:
++                baseline = 19  # fallback to known baseline
++            if test_failures > baseline:
++                log(f"  ✗ tests regressed (maker diagnostic): {test_failures} failures (baseline {baseline})")
++                run_bash("find frontend/src -name '*.bak' -exec sh -c 'mv \"$0\" \"${0%.bak}\"' {} \\;")
++                return OUTCOME_FAIL
++            elif test_failures < baseline:
++                # Improved — update baseline (absolute path)
++                (Path.home() / "projects/coco-steal/.test-baseline-failures").write_text(str(test_failures))
++                log(f"  ✓ tests improved: {test_failures} failures (was {baseline}) — baseline updated")
++            else:
++                log(f"  ✓ tests stable: {test_failures} failures (matches baseline)")
++        # Clean up backups
++        run_bash("find frontend/src backend/app -name '*.bak' -delete 2>/dev/null; echo ok")
++        # Commit
++        commit_msg = f"{task['id']}: {task['name'][:60]} (QB Sonnet 4.6 via cursor-agent)\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
++        import shlex as _shlex
++        _uniq = []
++        for _f in touched_files:
++            if _f not in _uniq:
++                _uniq.append(_f)
++        if not _uniq and not diff_text.strip():
++            log(f"  ✓ #{task['id']} — no files written this task; nothing to commit")
++            return OUTCOME_SUCCESS
++
++        diagnostic = {
++            "tsc": "pass" if tsc_ok else "fail",
++            "test_failures": test_failures,
++        }
++
++        if is_propose_only_mode():
++            reasoning = (
++                f"Maker completed edits for {len(_uniq)} file(s); "
++                f"diagnostic tsc={diagnostic['tsc']} test_failures={diagnostic['test_failures']}"
+             )
+-            log(f"  💾 fix stored in memory")
+-        except Exception:
+-            pass  # memory storage is best-effort
+-        # Wire 3: record success signal for skill distillation
+-        _record_signal(task, "success")
+-        _maybe_distill_skill()
+-        return True
+-    log(f"  ✗ commit failed: {r[:200]}")
+-    return False
++            log(f"  📋 PROPOSE_ONLY — recording proposal for #{task['id']} (no commit)")
++            _record_proposal(task, _uniq, diff_text, reasoning, before_dirty, diagnostic)
++            return OUTCOME_PROPOSE_ONLY
++
++        reasoning = f"Maker completed edits for {len(_uniq)} file(s); diagnostics passed"
++
++        log("  verifier reviewing proposal...")
++        v = verify_proposal(REPO, task, _uniq, diff_text)
++        log(f"  verifier verdict: {v.verdict.value} — {v.reasoning[:200]}")
++        _append_run_log({
++            "outcome": v.verdict.value.lower(),
++            "task_id": task.get("id"),
++            "items_found": 1,
++            "actions_taken": [f"verifier:{v.verdict.value}"],
++            "escalations": [],
++            "human_verdict": None,
++            "verifier_reasoning": v.reasoning[:500],
++            "verifier_verdict": v.verdict.value,
++            "last_progress": f"verifier {v.verdict.value} for #{task.get('id')}",
++            "tokens_estimate": 15000,
++        })
++        if v.verdict != Verdict.APPROVE:
++            log("  ✗ verifier rejected — no commit")
++            return OUTCOME_FAIL
++
++        _add = "git add -- " + " ".join(_shlex.quote(f) for f in _uniq)
++        r = run_bash(f'{_add} && git commit -m "{commit_msg}"')
++        if "nothing to commit" in r or "working tree clean" in r:
++            # Already fixed — cursor-agent or previous run committed the fix.
++            # "nothing to commit" after agent ran + tsc passed = fix already exists.
++            log(f"  ✓ #{task['id']} already committed (nothing new to commit) — treating as done")
++            return OUTCOME_SUCCESS
++        if "exit=0" in r:
++            log("  ✓ committed (verifier APPROVE)!")
++            # Store successful fix in agentmemory for future reuse
++            try:
++                import importlib.util as _ilu
++                spec = _ilu.spec_from_file_location("fix_memory", Path.home() / ".coco/fix-memory.py")
++                fm = _ilu.module_from_spec(spec); spec.loader.exec_module(fm)
++                commit_hash = run_bash("git rev-parse --short HEAD").split("\n")[0].replace("exit=0\n","").strip()
++                surface = task["id"].split("-")[0] if "-" in task["id"] else "unknown"
++                fm.remember_fix(
++                    surface=surface,
++                    issue_summary=task.get("name",""),
++                    instruction=task.get("instruction","")[:500],
++                    commit_hash=commit_hash,
++                    target_file=task.get("id",""),
++                )
++                log(f"  💾 fix stored in memory")
++            except Exception:
++                pass  # memory storage is best-effort
++            # Wire 3: record success signal for skill distillation
++            _record_signal(task, "success")
++            _maybe_distill_skill()
++            return OUTCOME_SUCCESS
++        log(f"  ✗ commit failed: {r[:200]}")
++        return OUTCOME_FAIL
++    finally:
++        if is_propose_only_mode() and before_dirty is not None:
++            _revert_working_tree(before_dirty)
+ 
+ # ── Task list ─────────────────────────────────────────────────────────────
+ # CONTRACT-STYLE TASKS — each is file-scoped, ≤200 lines, clear acceptance test
+@@ -497,6 +724,54 @@
+         pass  # skill distillation is best-effort
+ 
+ 
++
++def _escalate_to_human(task: dict, fail_count: int):
++    """T3: escalate to run-log + human — once per task (dedupe by id)."""
++    escalated = load_json_set(ESCALATED_FILE)
++    if not isinstance(escalated, dict):
++        escalated = {}
++    if task["id"] in escalated:
++        log(f"  ⏭️ #{task['id']} already escalated to run-log — skip")
++        return
++    now = datetime.now(timezone.utc).isoformat()
++    reason = f"task #{task.get('id')} failed {fail_count}× — human review required"
++    log(f"  🚨 escalating #{task['id']} to HUMAN (run-log)")
++    _append_run_log({
++        "run_id": f"coding-loop-escalate-{task['id']}-{now}",
++        "outcome": "escalated",
++        "task_id": task.get("id"),
++        "reason": reason,
++        "items_found": 1,
++        "actions_taken": [f"escalate: {task.get('id')}"],
++        "escalations": [reason],
++        "human_verdict": None,
++        "last_progress": now,
++        "tokens_estimate": EMPTY_WATCHLIST_TOKEN_BUDGET,
++    })
++    escalated[task["id"]] = now
++    save_json_atomic(ESCALATED_FILE, escalated)
++    try:
++        body = json.dumps({
++            "project": "coco-steal",
++            "kind": "loop_escalation",
++            "text": f"{reason}\nTask: {task.get('name', '')}\nInstruction: {task.get('instruction', '')[:500]}",
++            "next_step": f"Human: review escalated coding-loop task #{task.get('id')}",
++            "source_tool": "coding-loop",
++        }).encode()
++        req = urllib.request.Request(
++            "http://localhost:8001/api/brain/checkpoint",
++            data=body,
++            headers={"Content-Type": "application/json"},
++            method="POST",
++        )
++        with urllib.request.urlopen(req, timeout=8) as r:
++            r.read()
++    except Exception as e:
++        log(f"  (M0 escalation checkpoint skip: {e})")
++    with open(Path.home() / ".coco" / "logs" / "coding-loop-skipped.log", "a") as f:
++        f.write(f"[{datetime.now().isoformat()}] ESCALATED_HUMAN: {task['id']} — {task.get('name','')}\n")
++
++
+ def _escalate_to_self_improve(task: dict):
+     """Wire 2: failed task → self-improve cycle to rewrite the instruction."""
+     # Dedupe guard: escalate each task at most once so a permanently-failing
+@@ -609,10 +884,32 @@
+ def main():
+     log("=== CoCo agentic coding loop v2 — qwen3-coder full throttle ===")
+     done: set[str] = set()
++    proposed: set[str] = set(load_json_set(PROPOSED_FILE).keys())
++    _cycle_constraints: list[str] = []
+     while True:
+         if DISABLED.exists():
+             log("kill switch — stopping"); break
+ 
++        budget = check_cycle_budget()
++        log(f"budget: {budget.reason}")
++        if not budget.ok:
++            log("budget cap exceeded — sleeping 5min")
++            _append_run_log({
++                "outcome": "budget_pause",
++                "items_found": 0,
++                "actions_taken": ["budget_pause"],
++                "escalations": [],
++                "human_verdict": None,
++                "last_progress": "budget cap exceeded — sleeping",
++                "tokens_estimate": EMPTY_WATCHLIST_TOKEN_BUDGET,
++            })
++            time.sleep(300)
++            continue
++        if budget.report_only and not is_propose_only_mode():
++            log("budget ≥80% — forcing PROPOSE_ONLY for this cycle")
++
++        _cycle_constraints = load_constraints_preflight()
++
+         fail_counts = load_json_set(FAIL_COUNT_FILE)
+         all_tasks = TASKS + [t for t in load_dynamic_tasks() if t["id"] not in {x["id"] for x in TASKS}]
+         # Skip permanently failed tasks (>= MAX_TASK_FAILS) — don't clear done on restart
+@@ -622,6 +919,16 @@
+         pending = available
+ 
+         if not pending:
++            log(f"empty watchlist — early exit (<{EMPTY_WATCHLIST_TOKEN_BUDGET} tokens)")
++            _append_run_log({
++                "outcome": "no-op",
++                "items_found": 0,
++                "actions_taken": [],
++                "escalations": [],
++                "human_verdict": None,
++                "last_progress": "no-op-empty-watchlist",
++                "tokens_estimate": min(EMPTY_WATCHLIST_TOKEN_BUDGET, 1000),
++            })
+             # Only clear done for tasks that haven't hit fail limit
+             clearable = {tid for tid in done if fail_counts.get(tid, 0) < MAX_TASK_FAILS}
+             if clearable:
+@@ -655,19 +962,27 @@
+             time.sleep(5)
+             continue
+ 
+-        ok = run_task_agentic(task)
++        global _FORCE_PROPOSE_ONLY
++        _FORCE_PROPOSE_ONLY = budget.report_only or is_propose_only_mode()
++
++        outcome = run_task_agentic(task)
++        _FORCE_PROPOSE_ONLY = False
+         release_claim(task["id"])
+ 
+-        if ok:
++        if outcome == OUTCOME_SUCCESS:
+             done.add(task["id"])
++            proposed.discard(task["id"])
+             log(f"  ✓ #{task['id']} complete")
++        elif outcome == OUTCOME_PROPOSE_ONLY:
++            proposed.add(task["id"])
++            log(f"  📋 #{task['id']} proposed — NOT in done (will resurface until human review)")
+         else:
+             n = increment_fail(task["id"])
+             done.add(task["id"])
+-            _record_signal(task, "fail")  # Wire 3: record failure for skill learning
++            _record_signal(task, "fail")
+             if n >= MAX_TASK_FAILS:
+-                log(f"  ✗ #{task['id']} failed {n}× — escalating to self-improve cycle")
+-                _escalate_to_self_improve(task)
++                log(f"  ✗ #{task['id']} failed {n}× — escalating to HUMAN")
++                _escalate_to_human(task, n)
+             else:
+                 log(f"  ✗ #{task['id']} failed ({n}/{MAX_TASK_FAILS}) — will retry next cycle")
+         time.sleep(10)
