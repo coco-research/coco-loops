@@ -1,6 +1,6 @@
---- coding-loop.py	2026-06-30 18:40:46
-+++ coding-loop.py	2026-06-30 19:39:09
-@@ -7,27 +7,54 @@
+--- coding-loop.py (pre-framework baseline)
++++ coding-loop.py (framework-integrated: L1 propose-only + verifier + budget + skip-proposed + gate-wait + lifetime)
+@@ -7,27 +7,58 @@
  Local qwen3-coder (call_llm / TOOLS below) is retained for imports and background
  work only — no longer used in the fix path.
  
@@ -20,12 +20,16 @@
  
  HOME = Path.home()
 +REPO_EARLY = HOME / "projects" / "coco-steal"
-+sys.path.insert(0, str(REPO_EARLY / "backend"))
-+from app.loops.budget import BudgetStatus, check_cycle_budget
-+from app.loops.verifier import Verdict, verify_proposal
++# coco-loops is now a standalone product; CoCo consumes it (customer #1).
++_COCO_LOOPS_PATH = os.environ.get("COCO_LOOPS_PATH", str(HOME / "projects" / "coco-loops"))
++sys.path.insert(0, _COCO_LOOPS_PATH)
++from coco_loops.budget import BudgetStatus, check_cycle_budget
++from coco_loops.verifier import Verdict, verify_proposal
++from coco_loops import lifetime
 +
 +HOME = Path.home()
  DISABLED = HOME / ".coco" / "coding-loop.disabled"
++LOOP_ID = "coding-loop"  # for coco_loops.lifetime state (~/.coco/coding-loop.lifetime.json)
 +PROPOSE_ONLY_FLAG = HOME / ".coco" / "coding-loop.propose-only"
 +RUN_LOG = HOME / ".coco" / "loop-run-log.jsonl"
 +PROPOSED_FILE = HOME / ".coco" / "coding-loop-proposed.json"
@@ -35,7 +39,7 @@
  LLM_EP = "http://127.0.0.1:1234/v1/chat/completions"
  MODEL = "qwen3-coder-30b-a3b-instruct"
 -REPO = HOME / "projects" / "coco-steal"
-+REPO = REPO_EARLY
++REPO = Path(os.environ.get("CODING_LOOP_REPO", str(REPO_EARLY)))  # isolated worktree when set
  FE = REPO / "frontend" / "src"
  BE = REPO / "backend" / "app"
  MAX_TURNS = 8  # max tool-use turns per task
@@ -59,14 +63,14 @@
  def ts(): return datetime.now().strftime("%H:%M:%S")
  def log(m):
      line=f"[{ts()}] {m}"; print(line,flush=True)
-@@ -203,17 +230,166 @@
+@@ -203,17 +234,166 @@
      return False
  
  
 -def run_task_agentic(task: dict) -> bool:
 +def _append_run_log(entry: dict):
 +    """Append schema-compliant entry; preserves optional extensions for cli status."""
-+    from app.loops.run_log import RunLogEntry
++    from coco_loops.run_log import RunLogEntry
 +
 +    now = datetime.now(timezone.utc).isoformat()
 +    record = {
@@ -229,7 +233,7 @@
      system = (
          "You are an expert TypeScript/Python engineer fixing bugs in the CoCo platform. "
          f"Repo root: {REPO}. Frontend: {FE}. Backend: {BE}. "
-@@ -240,79 +416,130 @@
+@@ -240,80 +420,131 @@
              log(f"  (memory recall skip: {e})")
      if sg.current_policy() == "paused":
          log("scheduler gate: paused — skipping")
@@ -371,7 +375,7 @@
 +            log(f"  📋 PROPOSE_ONLY — recording proposal for #{task['id']} (no commit)")
 +            _record_proposal(task, _uniq, diff_text, reasoning, before_dirty, diagnostic)
 +            return OUTCOME_PROPOSE_ONLY
-+
+ 
 +        reasoning = f"Maker completed edits for {len(_uniq)} file(s); diagnostics passed"
 +
 +        log("  verifier reviewing proposal...")
@@ -428,13 +432,16 @@
 +    finally:
 +        if is_propose_only_mode() and before_dirty is not None:
 +            _revert_working_tree(before_dirty)
- 
++
  # ── Task list ─────────────────────────────────────────────────────────────
  # CONTRACT-STYLE TASKS — each is file-scoped, ≤200 lines, clear acceptance test
-@@ -497,6 +724,54 @@
+ TASKS = [
+@@ -495,6 +726,54 @@
+         SKILL_SIGNALS.write_text("")
+     except Exception as e:
          pass  # skill distillation is best-effort
- 
- 
++
++
 +
 +def _escalate_to_human(task: dict, fail_count: int):
 +    """T3: escalate to run-log + human — once per task (dedupe by id)."""
@@ -481,12 +488,10 @@
 +        log(f"  (M0 escalation checkpoint skip: {e})")
 +    with open(Path.home() / ".coco" / "logs" / "coding-loop-skipped.log", "a") as f:
 +        f.write(f"[{datetime.now().isoformat()}] ESCALATED_HUMAN: {task['id']} — {task.get('name','')}\n")
-+
-+
+ 
+ 
  def _escalate_to_self_improve(task: dict):
-     """Wire 2: failed task → self-improve cycle to rewrite the instruction."""
-     # Dedupe guard: escalate each task at most once so a permanently-failing
-@@ -609,10 +884,32 @@
+@@ -609,19 +888,67 @@
  def main():
      log("=== CoCo agentic coding loop v2 — qwen3-coder full throttle ===")
      done: set[str] = set()
@@ -496,6 +501,13 @@
          if DISABLED.exists():
              log("kill switch — stopping"); break
  
++        # Bounded lifetime: stop for good once the active-work budget is spent.
++        # Touch the kill-switch so a launchd restart exits immediately (durable death).
++        if lifetime.is_expired(LOOP_ID):
++            log(f"lifetime budget spent ({lifetime.fmt_duration(lifetime.used_seconds(LOOP_ID))} of work) — stopping")
++            DISABLED.touch()
++            break
++
 +        budget = check_cycle_budget()
 +        log(f"budget: {budget.reason}")
 +        if not budget.ok:
@@ -514,12 +526,23 @@
 +        if budget.report_only and not is_propose_only_mode():
 +            log("budget ≥80% — forcing PROPOSE_ONLY for this cycle")
 +
++        # v7: when the scheduler gate is paused (high load / low RAM / low battery),
++        # WAIT — do not attempt tasks. Attempting would return OUTCOME_FAIL, which
++        # increments fail-counts and triggers false escalations (gate-pause != task failure).
++        if sg.current_policy() == "paused":
++            log("scheduler gate paused (load/RAM/battery) — waiting 2min (tasks not attempted, no fail counted)")
++            time.sleep(120)
++            continue
++
 +        _cycle_constraints = load_constraints_preflight()
 +
          fail_counts = load_json_set(FAIL_COUNT_FILE)
          all_tasks = TASKS + [t for t in load_dynamic_tasks() if t["id"] not in {x["id"] for x in TASKS}]
          # Skip permanently failed tasks (>= MAX_TASK_FAILS) — don't clear done on restart
-@@ -622,6 +919,16 @@
+         available = [t for t in all_tasks
+                      if t["id"] not in done
++                     and t["id"] not in proposed
+                      and fail_counts.get(t["id"], 0) < MAX_TASK_FAILS]
          pending = available
  
          if not pending:
@@ -536,7 +559,7 @@
              # Only clear done for tasks that haven't hit fail limit
              clearable = {tid for tid in done if fail_counts.get(tid, 0) < MAX_TASK_FAILS}
              if clearable:
-@@ -655,19 +962,27 @@
+@@ -655,19 +982,29 @@
              time.sleep(5)
              continue
  
@@ -544,7 +567,9 @@
 +        global _FORCE_PROPOSE_ONLY
 +        _FORCE_PROPOSE_ONLY = budget.report_only or is_propose_only_mode()
 +
++        _work_start = time.time()
 +        outcome = run_task_agentic(task)
++        lifetime.tick(LOOP_ID, int(time.time() - _work_start))  # count only active work time
 +        _FORCE_PROPOSE_ONLY = False
          release_claim(task["id"])
  

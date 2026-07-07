@@ -73,4 +73,4 @@ tests/               # framework tests
 
 ## License
 
-Internal / local use. See consumer project for distribution terms.
+Proprietary. Copyright (c) 2026 Coco Inc (coco-research). All rights reserved. See [LICENSE](LICENSE). Shared with partners under executed NDA / partnership terms.

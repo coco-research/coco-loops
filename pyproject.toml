@@ -8,6 +8,8 @@ version = "1.0.0"
 description = "Principle-governed self-evolving loop orchestration framework (stdlib only)"
 readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+classifiers = ["License :: Other/Proprietary License"]
 dependencies = []
 
 [project.optional-dependencies]
