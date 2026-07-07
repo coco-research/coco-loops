@@ -321,6 +321,37 @@ def cmd_charter(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    from coco_loops.runner import (
+        RunnerConfig,
+        cursor_agent_maker,
+        file_task_source,
+        run,
+        run_cycle,
+    )
+
+    repo = Path(args.repo) if args.repo else Path.cwd()
+    tasks = Path(args.tasks) if args.tasks else (resolve_state_dir() / f"{args.loop}-tasks.json")
+    cfg = RunnerConfig(
+        loop_id=args.loop,
+        repo=repo,
+        task_source=file_task_source(tasks),
+        maker=cursor_agent_maker(args.model),
+        poll_interval_seconds=args.interval,
+        max_cycles=1 if args.once else args.max_cycles,
+    )
+
+    if args.once:
+        result = run_cycle(cfg)
+        print(f"{args.loop}: {result.outcome} - {result.detail}")
+        return 1 if result.outcome == "error" else 0
+
+    results = run(cfg)
+    last = results[-1].outcome if results else "none"
+    print(f"{args.loop}: {len(results)} cycle(s); last = {last}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="coco-loops",
@@ -393,6 +424,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --install, write the contract but do not arm the lifetime yet",
     )
 
+    run_p = sub.add_parser(
+        "run",
+        help="Run a chartered loop (propose-only) using cursor-agent + a JSON task queue",
+    )
+    run_p.add_argument("loop", help="Loop id, e.g. keep-build-green")
+    run_p.add_argument(
+        "--tasks",
+        default=None,
+        help="JSON task-queue file (default: <state-dir>/<loop>-tasks.json)",
+    )
+    run_p.add_argument(
+        "--repo",
+        default=None,
+        help="Repo or dedicated worktree to operate in (default: cwd). Must be clean.",
+    )
+    run_p.add_argument("--model", default="composer-2.5", help="cursor-agent model")
+    run_p.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    run_p.add_argument(
+        "--max-cycles",
+        dest="max_cycles",
+        type=int,
+        default=None,
+        help="Stop after N cycles (default: until paused/expired)",
+    )
+    run_p.add_argument(
+        "--interval", type=float, default=60.0, help="Seconds to sleep between cycles"
+    )
+
     return parser
 
 
@@ -407,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         "promote": cmd_promote,
         "verify": cmd_verify,
         "charter": cmd_charter,
+        "run": cmd_run,
     }
     return handlers[args.command](args)
 

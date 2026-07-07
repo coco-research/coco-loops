@@ -108,8 +108,20 @@ tools, so the flow works in Cursor and any MCP client, not only Claude Code. It 
 out to the same `coco-loops` CLI, so there is one implementation of the governance and
 one place the floor is enforced. Ships under `consumers/mcp/`.
 
+## Runner
+
+A chartered, armed loop still needs something to execute it. The generic runner
+(`coco_loops/runner.py`, CLI `coco-loops run`) is that engine. It runs one governed
+cycle: pop a task, a maker proposes a change to the working tree, the separate verifier
+judges it, the proposal is logged, and the tree is reverted. At L1 nothing commits. It
+refuses to run on a dirty tree (so its revert cannot clobber uncommitted work; use a
+dedicated worktree), honors the kill-switch, global pause, budget, and lifetime expiry,
+and counts only active-work time against the lifetime. The maker is pluggable; the
+default shells out to cursor-agent (sanctioned, QB-routed).
+
 ## Status
 
 - **B2 charter engine:** built (`coco_loops/charter.py`, `coco-loops charter`), tested.
-- **B1 skill:** pending.
-- **B3 MCP server:** pending.
+- **B0 runner:** built (`coco_loops/runner.py`, `coco-loops run`), tested.
+- **B1 skill:** built (`consumers/claude-code/coco-loop/SKILL.md`).
+- **B3 MCP server:** built (`consumers/mcp/server.py`), syntax-checked in CI.

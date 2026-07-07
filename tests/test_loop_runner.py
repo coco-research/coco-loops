@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from coco_loops import lifetime, runner
+from coco_loops.cli import main
 from coco_loops.paths import kill_switch_path, reset_config
 from coco_loops.run_log import RunLog
 from coco_loops.runner import CycleResult, RunnerConfig, run, run_cycle
@@ -243,3 +244,23 @@ class TestFileTaskSource:
 
     def test_missing_file_is_none(self, tmp_path):
         assert runner.file_task_source(tmp_path / "nope.json")() is None
+
+
+class TestCliRun:
+    def test_run_once_noop_when_no_tasks(self, git_repo, state_env, capsys):
+        # missing task queue -> no-op, so the cursor-agent maker is never invoked
+        lifetime.arm(LOOP, 3600)
+        rc = main(
+            [
+                "run",
+                LOOP,
+                "--once",
+                "--repo",
+                str(git_repo),
+                "--tasks",
+                str(state_env / "no-such-tasks.json"),
+            ]
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "no-op" in out
