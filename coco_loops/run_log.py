@@ -25,6 +25,7 @@ REQUIRED_FIELDS = frozenset({
 class RunLogEntry:
     run_id: str
     items_found: int
+    loop_id: str | None = None
     actions_taken: list[str] = field(default_factory=list)
     escalations: list[str] = field(default_factory=list)
     tokens_estimate: int = 0
@@ -47,6 +48,7 @@ class RunLogEntry:
         return cls(
             run_id=str(data["run_id"]),
             items_found=int(data.get("items_found", 0)),
+            loop_id=(str(data["loop_id"]) if data.get("loop_id") else None),
             actions_taken=list(data.get("actions_taken") or []),
             escalations=list(data.get("escalations") or []),
             tokens_estimate=int(data.get("tokens_estimate", 0)),
