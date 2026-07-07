@@ -18,6 +18,7 @@ from coco_loops.budget import (
     summarize_coding_loop_spend,
     summarize_loop_spend,
 )
+from coco_loops import charter as charter_mod
 from coco_loops import lifetime
 from coco_loops.paths import (
     configure,
@@ -275,6 +276,51 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return proc.returncode
 
 
+def cmd_charter(args: argparse.Namespace) -> int:
+    if args.schema:
+        print(json.dumps(charter_mod.CHARTER_SCHEMA, indent=2))
+        return 0
+    if not args.from_json:
+        print("charter: provide --from-json <path|-> (or --schema)", file=sys.stderr)
+        return 2
+
+    if args.from_json == "-":
+        text = sys.stdin.read()
+    else:
+        path = Path(args.from_json)
+        if not path.exists():
+            print(f"charter file not found: {path}", file=sys.stderr)
+            return 1
+        text = path.read_text(encoding="utf-8")
+
+    try:
+        charter = charter_mod.load_charter_json(text)
+        problems = charter_mod.validate(charter)
+    except charter_mod.CharterError as exc:
+        problems = exc.problems
+        charter = None
+
+    if problems:
+        print("charter is invalid:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return 1
+
+    print(charter_mod.render(charter))
+
+    if args.install:
+        result = charter_mod.install(charter, arm=not args.no_arm)
+        print("")
+        print(f"installed: {result['contract_path']}")
+        if result["armed_cap_seconds"] is not None:
+            print(
+                f"armed {charter.loop_id} for {charter.lifetime} "
+                "(kill-switch cleared) - propose-only"
+            )
+            print(f"inspect: coco-loops status {charter.loop_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="coco-loops",
@@ -320,6 +366,33 @@ def build_parser() -> argparse.ArgumentParser:
     verify_p = sub.add_parser("verify", help="Run loop framework pytest suite")
     verify_p.add_argument("-v", "--verbose", action="store_true")
 
+    charter_p = sub.add_parser(
+        "charter",
+        help="Validate, render, or install a compiled loop charter (goal -> governed loop)",
+    )
+    charter_p.add_argument(
+        "--from-json",
+        dest="from_json",
+        metavar="PATH",
+        help="Charter JSON file, or - to read from stdin",
+    )
+    charter_p.add_argument(
+        "--schema",
+        action="store_true",
+        help="Print the charter JSON schema a consumer should fill, then exit",
+    )
+    charter_p.add_argument(
+        "--install",
+        action="store_true",
+        help="Persist the contract and arm the lifetime cap (propose-only)",
+    )
+    charter_p.add_argument(
+        "--no-arm",
+        dest="no_arm",
+        action="store_true",
+        help="With --install, write the contract but do not arm the lifetime yet",
+    )
+
     return parser
 
 
@@ -333,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": cmd_status,
         "promote": cmd_promote,
         "verify": cmd_verify,
+        "charter": cmd_charter,
     }
     return handlers[args.command](args)
 

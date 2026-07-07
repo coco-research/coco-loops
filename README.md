@@ -22,9 +22,22 @@ No third-party runtime dependencies. Dev extra installs `pytest`.
 ```bash
 coco-loops list                          # contracts, levels, pause state
 coco-loops status <loop-id>              # run-log + budget for one loop
+coco-loops start <loop-id> --for 4h      # arm a lifetime cap + clear kill-switch
 coco-loops promote <loop-id>             # L1→L2 promotion gate (PASS/FAIL)
 coco-loops verify                        # run framework pytest suite
+coco-loops charter --schema              # print the charter schema (goal → loop)
+coco-loops charter --from-json - --install   # compile a goal into a governed loop
 ```
+
+## Consumer layer (goal → governed loop)
+
+For someone who just wants to state a goal and get a safe loop, without wiring the
+framework by hand: a plain-language goal is compiled into a **charter** (readable
+principles + a lifetime cap + level L1), validated against the immutable constitution
+floor, confirmed by the person, then installed as a propose-only loop. The model that
+compiles the goal lives in the consumer (the `/coco-loop` skill or an MCP client); the
+framework only validates and installs, so the governance core stays model-free. See
+[specs/consumer-layer.md](specs/consumer-layer.md).
 
 ### Path configuration
 
