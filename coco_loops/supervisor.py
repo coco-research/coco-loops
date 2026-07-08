@@ -1,12 +1,14 @@
 """Heartbeat supervisor — third control signal beside kill-switch and budget-pause."""
 from __future__ import annotations
 
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Protocol
+from typing import Callable, Optional, Protocol
 
-from coco_loops.run_log import RunLog
+from coco_loops.run_log import RunLog, RunLogEntry
 
 
 class Liveness(str, Enum):
@@ -136,3 +138,84 @@ def decide(
 
 def apply_revive(state: SupervisorState) -> SupervisorState:
     return SupervisorState(revive_count=state.revive_count + 1)
+
+
+# --- live driver: turn the pure decide() into a running heartbeat watcher -------
+
+@dataclass
+class WatchConfig:
+    loop_id: str
+    supervisor: SupervisorConfig
+    process_checker: ProcessChecker
+    revive_fn: Optional[Callable[[], None]] = None
+    once: bool = False
+    max_iterations: Optional[int] = None
+
+
+def _log_supervisor(run_log: RunLog, loop_id: str, decision: SupervisorDecision, tag: str) -> None:
+    escalations = (
+        [f"supervisor escalation: {decision.liveness.value}"]
+        if decision.action == SupervisorAction.ESCALATE_HUMAN
+        else []
+    )
+    run_log.append(
+        RunLogEntry(
+            run_id=f"{loop_id}-sup-{uuid.uuid4().hex[:8]}",
+            loop_id=loop_id,
+            items_found=0,
+            actions_taken=[
+                f"supervisor: {decision.liveness.value} -> {decision.action.value} ({tag})",
+                *decision.evidence,
+            ],
+            escalations=escalations,
+            tokens_estimate=0,
+            outcome=f"supervisor-{tag}",
+            last_progress=f"supervisor {tag}: {decision.liveness.value}",
+        )
+    )
+
+
+def watch(
+    config: WatchConfig,
+    run_log: RunLog,
+    *,
+    clock: Clock | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+) -> list[SupervisorDecision]:
+    """Run the heartbeat: classify liveness, act (revive / escalate), repeat.
+
+    REVIVE calls the injected revive_fn (e.g. clear the kill-switch or kickstart the
+    daemon) and increments the revive count. ESCALATE_HUMAN logs and stops, because a
+    human must intervene. NONE (alive) just records nothing new. The watcher stops on
+    the first escalation, when `once` is set, or after `max_iterations`.
+    """
+    sleep = sleep_fn or time.sleep
+    state = SupervisorState()
+    decisions: list[SupervisorDecision] = []
+    iteration = 0
+
+    while True:
+        decision = decide(
+            config=config.supervisor,
+            state=state,
+            run_log=run_log,
+            process_checker=config.process_checker,
+            clock=clock,
+        )
+        decisions.append(decision)
+
+        if decision.action == SupervisorAction.REVIVE:
+            if config.revive_fn is not None:
+                config.revive_fn()
+            state = apply_revive(state)
+            _log_supervisor(run_log, config.loop_id, decision, "revive")
+        elif decision.action == SupervisorAction.ESCALATE_HUMAN:
+            _log_supervisor(run_log, config.loop_id, decision, "escalate")
+            break
+
+        iteration += 1
+        if config.once or (config.max_iterations is not None and iteration >= config.max_iterations):
+            break
+        sleep(config.supervisor.cadence_seconds)
+
+    return decisions

@@ -27,6 +27,9 @@ coco-loops promote <loop-id>             # L1→L2 promotion gate (PASS/FAIL)
 coco-loops verify                        # run framework pytest suite
 coco-loops charter --schema              # print the charter schema (goal → loop)
 coco-loops charter --from-json - --install   # compile a goal into a governed loop
+coco-loops run <loop-id> --repo <wt> --tasks q.json   # run a loop propose-only
+coco-loops supervise <loop-id>           # one heartbeat check (liveness → revive/escalate)
+coco-loops label <run-id> <verdict>      # record a human_verdict (feeds promotion gate)
 ```
 
 ## Consumer layer (goal → governed loop)

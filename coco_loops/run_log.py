@@ -131,3 +131,29 @@ class RunLog:
         if not entries:
             return None
         return entries[-1].last_progress
+
+    def set_verdict(self, run_id: str, verdict: str) -> bool:
+        """Record a human_verdict on the entry with run_id, rewriting the log.
+
+        This is the write-path the promotion gate reads from: a human labels a
+        proposal (for example ``correct`` or ``false_positive``) so the L1->L2 gate
+        can compute a false-positive rate. Returns True if a matching entry was found.
+        """
+        if not self.path.exists():
+            return False
+        lines = [ln for ln in self.path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        found = False
+        rewritten: list[str] = []
+        for line in lines:
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                rewritten.append(line)
+                continue
+            if str(data.get("run_id")) == str(run_id):
+                data["human_verdict"] = verdict
+                found = True
+            rewritten.append(json.dumps(data, ensure_ascii=False))
+        if found:
+            self.path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+        return found

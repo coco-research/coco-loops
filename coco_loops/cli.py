@@ -352,6 +352,40 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_supervise(args: argparse.Namespace) -> int:
+    from coco_loops.supervisor import SupervisorConfig, WatchConfig, watch
+
+    cfg = WatchConfig(
+        loop_id=args.loop,
+        supervisor=SupervisorConfig(
+            cadence_seconds=args.cadence,
+            tolerance_intervals=args.tolerance,
+            max_revives=args.max_revives,
+        ),
+        process_checker=lambda: True,  # standalone diagnostic: heartbeat via last_progress
+        revive_fn=None,
+        once=True,  # one heartbeat per invocation; run under launchd/cron for continuous
+    )
+    decisions = watch(cfg, RunLog(resolve_run_log_path()))
+    last = decisions[-1] if decisions else None
+    if last is None:
+        print(f"{args.loop}: no decision")
+        return 0
+    print(f"{args.loop}: liveness={last.liveness.value} action={last.action.value}")
+    for line in last.evidence:
+        print(f"  {line}")
+    return 0
+
+
+def cmd_label(args: argparse.Namespace) -> int:
+    log = RunLog(resolve_run_log_path())
+    if log.set_verdict(args.run_id, args.verdict):
+        print(f"labeled {args.run_id} -> human_verdict={args.verdict}")
+        return 0
+    print(f"run_id not found in run-log: {args.run_id}", file=sys.stderr)
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="coco-loops",
@@ -452,6 +486,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--interval", type=float, default=60.0, help="Seconds to sleep between cycles"
     )
 
+    supervise_p = sub.add_parser(
+        "supervise",
+        help="One heartbeat check of a loop (liveness -> revive/escalate), logged to the run-log",
+    )
+    supervise_p.add_argument("loop", help="Loop id")
+    supervise_p.add_argument(
+        "--cadence", type=int, default=900, help="Expected progress cadence in seconds"
+    )
+    supervise_p.add_argument(
+        "--tolerance", type=int, default=3, help="Cadence intervals of no progress before DOZING"
+    )
+    supervise_p.add_argument(
+        "--max-revives", dest="max_revives", type=int, default=3, help="Revives before escalating"
+    )
+
+    label_p = sub.add_parser(
+        "label",
+        help="Record a human_verdict on a run-log entry (feeds the promotion gate)",
+    )
+    label_p.add_argument("run_id", help="run_id of the entry to label")
+    label_p.add_argument("verdict", help="e.g. correct | false_positive | noise")
+
     return parser
 
 
@@ -467,6 +523,8 @@ def main(argv: list[str] | None = None) -> int:
         "verify": cmd_verify,
         "charter": cmd_charter,
         "run": cmd_run,
+        "supervise": cmd_supervise,
+        "label": cmd_label,
     }
     return handlers[args.command](args)
 
