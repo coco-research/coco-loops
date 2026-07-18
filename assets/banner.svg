@@ -1,0 +1,51 @@
+<svg width="1280" height="320" viewBox="0 0 1280 320" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="coco-loops — principle-governed self-evolving loops">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="320" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#0f1d3a"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="820" y1="70" x2="1180" y2="250" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4C8DFF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="1010" cy="160" r="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4C8DFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#4C8DFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="320" rx="20" fill="url(#bg)"/>
+  <rect x="0.5" y="0.5" width="1279" height="319" rx="19.5" fill="none" stroke="#243252" stroke-opacity="0.6"/>
+  <circle cx="1010" cy="160" r="180" fill="url(#glow)"/>
+
+  <!-- Left: wordmark + tagline -->
+  <text x="72" y="118" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="58" font-weight="700" fill="#F8FAFC">coco<tspan fill="#4C8DFF">-</tspan>loops</text>
+  <text x="74" y="164" font-family="Segoe UI,Helvetica,Arial,sans-serif" font-size="25" font-weight="600" fill="#C7D2E5">Principle-governed self-evolving loops</text>
+  <text x="74" y="200" font-family="Segoe UI,Helvetica,Arial,sans-serif" font-size="18" fill="#8595B4">Immutable constitution · separate-adversary verify · budget caps · append-only audit</text>
+
+  <!-- chips -->
+  <g font-family="ui-monospace,Menlo,monospace" font-size="15" fill="#AFC0E0">
+    <rect x="74" y="228" width="132" height="34" rx="17" fill="#16223f" stroke="#2b3c63"/>
+    <text x="140" y="250" text-anchor="middle">stdlib-only</text>
+    <rect x="216" y="228" width="150" height="34" rx="17" fill="#16223f" stroke="#2b3c63"/>
+    <text x="291" y="250" text-anchor="middle">propose-only</text>
+    <rect x="376" y="228" width="176" height="34" rx="17" fill="#16223f" stroke="#2b3c63"/>
+    <text x="464" y="250" text-anchor="middle">promotion gates</text>
+  </g>
+
+  <!-- Right: governed loop motif -->
+  <g transform="translate(1010,160)">
+    <circle r="104" fill="none" stroke="#243252" stroke-width="2"/>
+    <circle r="72" fill="none" stroke="#2b3c63" stroke-width="2" stroke-dasharray="6 8"/>
+    <!-- loop arrow -->
+    <path d="M 0 -104 A 104 104 0 1 1 -90 52" fill="none" stroke="url(#accent)" stroke-width="9" stroke-linecap="round"/>
+    <path d="M -90 52 l -20 -6 l 14 18 z" fill="#8B5CF6"/>
+    <!-- verifier shield -->
+    <g transform="translate(0,-4)">
+      <path d="M 0 -40 L 34 -26 L 34 8 C 34 30 18 44 0 52 C -18 44 -34 30 -34 8 L -34 -26 Z" fill="#16223f" stroke="#4C8DFF" stroke-width="3"/>
+      <path d="M -14 2 L -3 14 L 17 -12" fill="none" stroke="#4C8DFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+
+  <text x="72" y="292" font-family="Segoe UI,Helvetica,Arial,sans-serif" font-size="15" fill="#5f6f92">part of CoCo Research · coco-research/coco-loops</text>
+</svg>
