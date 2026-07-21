@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -10,8 +12,10 @@ from coco_loops.verifier import (
     ChangeSpec,
     ExecutedTestResult,
     Verdict,
+    _run_independent_tests,
     check_constitution_violations,
     verify,
+    verify_proposal,
 )
 
 
@@ -114,3 +118,91 @@ class TestVerifierApprove:
         constitution = Path(__file__).resolve().parents[1] / "specs" / "loop-constitution.md"
         assert constitution.exists()
         monkeypatch.setenv("COCO_LOOPS_DIR", str(constitution.parent))
+
+
+class TestIndependentTestsRust:
+    def test_crates_diff_invokes_cargo_commands(self, monkeypatch: pytest.MonkeyPatch):
+        repo = Path("/tmp/fake-repo")
+        files = ["crates/connect-m0-backend/src/routes.rs"]
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "ok"
+            result.stderr = ""
+            return result
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = _run_independent_tests(repo, files)
+
+        assert result.tests_run > 0
+        assert result.passed is True
+        assert calls[0] == ["cargo", "build", "--workspace"]
+        assert ["cargo", "test", "-p", "connect-m0-backend"] in calls
+        assert [
+            "cargo",
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ] in calls
+
+    def test_unrecognized_files_reject_without_default_approve(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        repo = Path("/tmp/fake-repo")
+
+        def fake_run(cmd, **kwargs):
+            raise AssertionError("subprocess.run should not be called")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = _run_independent_tests(repo, ["README.md"])
+
+        assert result.tests_run == 0
+        assert result.passed is False
+        assert "no recognized test surface" in result.output
+
+
+class TestM0ForceEscalate:
+    @pytest.fixture
+    def passing_cargo_run(self, monkeypatch: pytest.MonkeyPatch):
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "ok"
+            result.stderr = ""
+            return result
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "crates/connect-m0-backend/src/schema.rs",
+            "crates/connect-m0-backend/src/llm.rs",
+            "crates/connect-sovereignty/src/guard.rs",
+            "crates/connect-m0-backend/Cargo.toml",
+        ],
+    )
+    def test_m0_paths_escalate_even_when_tests_pass(
+        self, passing_cargo_run, path: str, tmp_path: Path
+    ):
+        result = verify_proposal(
+            tmp_path,
+            {"name": "m0 touch"},
+            [path],
+            "diff",
+        )
+        assert result.verdict == Verdict.ESCALATE_HUMAN
+
+    def test_m0_escalate_wins_over_approve_via_verify(self):
+        change = ChangeSpec(
+            files_changed=["crates/connect-m0-backend/src/schema.rs"],
+            description="schema tweak",
+        )
+        result = verify(change, _passing_runner)
+        assert result.verdict == Verdict.ESCALATE_HUMAN
