@@ -21,7 +21,7 @@ Each line is one JSON object:
   "actions_taken": ["string"],
   "escalations": ["string"],
   "tokens_estimate": "integer (required, >= 0)",
-  "outcome": "no-op | report-only | fix-proposed | escalated (required)",
+  "outcome": "no-op | report-only | fix-proposed | escalated | paused | expired | error | maker-error | blocked (required)",
   "human_verdict": "string | null",
   "last_progress": "string (required)"
 }
@@ -60,10 +60,15 @@ Each line is one JSON object:
 
 | Value | Meaning |
 |-------|---------|
-| `no-op` | Empty watchlist; early-exit (<5k tokens); nothing to do |
+| `no-op` | Empty watchlist; early-exit (<5k tokens); nothing to do. Also: the maker ran and legitimately produced no diff (`files_changed` stayed empty) — **never** used when the maker failed to run at all; see `maker-error` / `blocked` below |
 | `report-only` | Triage/state updated; budget ≥80% forced report-only; or L1 observation only |
 | `fix-proposed` | Diff artifact + verifier dry-run logged; **no commit** (L1) |
 | `escalated` | Stopped; human handoff required (3rd failure, denylist, destructive, verifier ESCALATE_HUMAN) |
+| `paused` | Governance gate stopped the cycle before the maker ran: kill-switch, global pause, dirty tree, or the maker-error circuit breaker tripped (`coco_loops/runner.py` `run()`) |
+| `expired` | Lifetime budget exhausted; loop self-stopped (kill-switch touched) |
+| `error` | Runner-level exception (bug, IO failure, verifier crash unrelated to the maker itself) — never a silent success |
+| `maker-error` | The maker CLI ran but failed: non-zero exit, crash, or missing binary. Distinct from `no-op` on purpose — the maker never got to decide anything. Real stderr is carried into `actions_taken` / `escalations` |
+| `blocked` | The maker could not authenticate (recognisable auth error in its output), or the pre-flight probe run before the first cycle failed. Operator action required (e.g. `cursor-agent login`); when caught at pre-flight, **no lifetime budget or task-queue entry is spent** |
 
 At L2+, a committed fix may still log `fix-proposed` with `verifier_verdict: APPROVE` and `actions_taken` including `git:commit <hash>` — or add future value `fix-applied` when promotion gate extends schema.
 

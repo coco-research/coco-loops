@@ -318,38 +318,90 @@ def cmd_charter(args: argparse.Namespace) -> int:
                 "(kill-switch cleared) - propose-only"
             )
             print(f"inspect: coco-loops status {charter.loop_id}")
+
+        # Surface a broken maker now, not after the first cycles burn lifetime.
+        # `coco-loops run` decides the actual maker later (--maker-cmd can override
+        # the default), so this checks the default (cursor-agent) and warns only —
+        # it does not block install/arm.
+        from coco_loops.runner import cursor_agent_preflight
+
+        preflight = cursor_agent_preflight()
+        if not preflight.ok:
+            print("")
+            print(
+                "WARNING: default maker (cursor-agent) failed its pre-flight check:",
+                file=sys.stderr,
+            )
+            print(f"         {preflight.detail}", file=sys.stderr)
+            if preflight.hint:
+                print(f"         {preflight.hint}", file=sys.stderr)
+            print(
+                "         `coco-loops run` will refuse to start (and will not spend "
+                "any lifetime budget) until this is fixed.",
+                file=sys.stderr,
+            )
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    import shlex
+
     from coco_loops.runner import (
         RunnerConfig,
+        cli_agent_maker,
         cursor_agent_maker,
+        cursor_agent_preflight,
         file_task_source,
+        generic_binary_preflight,
+        maker_preflight_gate,
         run,
         run_cycle,
     )
 
     repo = Path(args.repo) if args.repo else Path.cwd()
     tasks = Path(args.tasks) if args.tasks else (resolve_state_dir() / f"{args.loop}-tasks.json")
+
+    # The maker is pluggable: --maker-cmd swaps in any CLI shaped like
+    # "<cmd> [flags...] <prompt>" instead of the default cursor-agent. Only PATH
+    # presence is pre-flighted for a custom maker (the framework doesn't know that
+    # CLI's auth subcommand); cursor-agent gets the fuller status/auth probe.
+    if args.maker_cmd:
+        argv_prefix = shlex.split(args.maker_cmd)
+        if not argv_prefix:
+            print("--maker-cmd must not be empty", file=sys.stderr)
+            return 2
+        maker = cli_agent_maker(argv_prefix)
+        preflight = lambda: generic_binary_preflight(argv_prefix[0])  # noqa: E731
+    else:
+        maker = cursor_agent_maker(args.model)
+        preflight = cursor_agent_preflight
+
     cfg = RunnerConfig(
         loop_id=args.loop,
         repo=repo,
         task_source=file_task_source(tasks),
-        maker=cursor_agent_maker(args.model),
+        maker=maker,
+        maker_preflight=preflight,
         poll_interval_seconds=args.interval,
         max_cycles=1 if args.once else args.max_cycles,
     )
 
     if args.once:
+        # run() would pre-flight internally, but --once calls run_cycle directly, so
+        # gate explicitly here: refuse to run (and burn no lifetime budget) if the
+        # maker cannot even authenticate.
+        gate = maker_preflight_gate(cfg)
+        if gate is not None:
+            print(f"{args.loop}: {gate.outcome} - {gate.detail}", file=sys.stderr)
+            return 1
         result = run_cycle(cfg)
         print(f"{args.loop}: {result.outcome} - {result.detail}")
-        return 1 if result.outcome == "error" else 0
+        return 1 if result.outcome in ("error", "maker-error", "blocked") else 0
 
     results = run(cfg)
     last = results[-1].outcome if results else "none"
     print(f"{args.loop}: {len(results)} cycle(s); last = {last}")
-    return 0
+    return 1 if last in ("error", "maker-error", "blocked") else 0
 
 
 def cmd_supervise(args: argparse.Namespace) -> int:
@@ -473,7 +525,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Repo or dedicated worktree to operate in (default: cwd). Must be clean.",
     )
-    run_p.add_argument("--model", default="composer-2.5", help="cursor-agent model")
+    run_p.add_argument(
+        "--model",
+        default="composer-2.5",
+        help="cursor-agent model (ignored if --maker-cmd is set)",
+    )
+    run_p.add_argument(
+        "--maker-cmd",
+        dest="maker_cmd",
+        default=None,
+        metavar="CMD",
+        help=(
+            "Use a different CLI-based maker instead of cursor-agent, e.g. "
+            "'my-agent --flag'. The task prompt is appended as the final argument "
+            "(shell-quoted string, split with shlex). Pre-flight for a custom maker "
+            "only checks it is on PATH (no auth probe) — see --model for the default."
+        ),
+    )
     run_p.add_argument("--once", action="store_true", help="Run a single cycle and exit")
     run_p.add_argument(
         "--max-cycles",

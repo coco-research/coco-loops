@@ -116,8 +116,20 @@ cycle: pop a task, a maker proposes a change to the working tree, the separate v
 judges it, the proposal is logged, and the tree is reverted. At L1 nothing commits. It
 refuses to run on a dirty tree (so its revert cannot clobber uncommitted work; use a
 dedicated worktree), honors the kill-switch, global pause, budget, and lifetime expiry,
-and counts only active-work time against the lifetime. The maker is pluggable; the
-default shells out to cursor-agent (sanctioned, QB-routed).
+and counts only active-work time against the lifetime. The maker is pluggable via
+`cli_agent_maker` (any CLI shaped `<cmd> [flags...] <prompt>`, or `coco-loops run
+--maker-cmd`); the default shells out to cursor-agent (sanctioned, QB-routed).
+
+A maker that could not run at all (missing binary, non-zero exit, auth failure) is
+never logged as `no-op` — that outcome is reserved for a maker that ran fine and
+legitimately found nothing to change. `MakerError`/`MakerAuthError` carry the real
+stderr into a distinct `maker-error`/`blocked` run-log outcome instead. A cheap
+pre-flight (`cursor_agent_preflight`, or `generic_binary_preflight` for a custom
+`--maker-cmd`) runs once before the first cycle and refuses to start — spending no
+lifetime budget — if the maker cannot even authenticate; `coco-loops charter --install`
+surfaces the same check as a non-blocking warning. `N` consecutive `maker-error`/
+`blocked` outcomes mid-run trip a circuit breaker that self-pauses the loop (kill-switch
+set) instead of grinding through the rest of its lifetime.
 
 ## Status
 

@@ -21,10 +21,22 @@ This module is stdlib-only (subprocess is stdlib, like the verifier's own test
 runner). The default maker shells out to `cursor-agent`, which is sanctioned and
 routes through the QuantumBlack gateway, satisfying constitution I3. A different
 maker can be injected; tests inject a fake.
+
+Maker failure vs. genuine no-op: a maker that legitimately ran and decided there was
+nothing to change is a completely different outcome from a maker that could not run
+at all (missing binary, crashed, or failed to authenticate). CLI-based makers built
+with `cli_agent_maker` (including the default `cursor_agent_maker`) never swallow a
+non-zero exit into a stringified "summary" — they raise `MakerAuthError` / `MakerError`
+carrying the real stderr, so `run_cycle` can log a distinct `blocked` / `maker-error`
+outcome instead of a bare `no-op`. A cheap `maker_preflight` probe can also be
+configured on `RunnerConfig` to refuse to start before the first cycle (see
+`maker_preflight_gate`, `cursor_agent_preflight`), so a loop does not spend its
+lifetime budget on cycles that cannot possibly succeed.
 """
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import time
 import uuid
@@ -39,7 +51,9 @@ from coco_loops.verifier import Verdict, verify_proposal
 
 # A maker edits the working tree to propose a change for one task, and returns a
 # short human-readable summary. The runner does NOT trust it: the diff is read
-# from git afterwards.
+# from git afterwards. A maker that could not run at all MUST raise MakerError (or
+# MakerAuthError) rather than returning a stringified failure — that is what lets
+# run_cycle tell "ran and found nothing" apart from "never actually ran".
 Maker = Callable[[dict, Path], str]
 
 # A task source returns the next task dict (with at least an 'id' plus a 'name' or
@@ -49,6 +63,49 @@ TaskSource = Callable[[], Optional[dict]]
 # A verifier judges (repo, task, files_changed, diff_text) and returns an object
 # exposing `.verdict` and `.reasoning`. Defaults to coco_loops.verifier.verify_proposal.
 VerifierFn = Callable[[Path, dict, list, str], object]
+
+
+class MakerError(RuntimeError):
+    """The maker CLI ran but failed: non-zero exit, crash, or missing binary.
+
+    Distinct from a genuine no-op (the maker ran fine and legitimately found nothing
+    to change — files_changed stays empty) and from a runner-level bug (caught
+    generically by run_cycle as outcome="error"). Carries the real stderr/stdout so
+    the run-log shows an operator what actually happened instead of a bare "no-op".
+    """
+
+    def __init__(self, message: str, *, returncode: Optional[int] = None, stderr: str = ""):
+        super().__init__(message)
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+class MakerAuthError(MakerError):
+    """The maker CLI could not authenticate (login lapsed / no API key configured).
+
+    A more specific, more actionable case of MakerError: the fix is an operator
+    action (e.g. `cursor-agent login`), not a code or task-quality problem.
+    """
+
+
+@dataclass
+class PreflightResult:
+    """Result of a cheap probe: can the maker actually run right now?"""
+
+    ok: bool
+    detail: str
+    hint: str = ""
+
+
+# A pre-flight probe, run once before the first cycle. Returns a PreflightResult;
+# never raises (a probe that cannot tell should report ok=False with a clear detail
+# rather than let an exception escape and be mistaken for something else).
+MakerPreflight = Callable[[], PreflightResult]
+
+# Default: pause the loop after this many consecutive maker-error/blocked outcomes,
+# rather than grinding through the rest of the lifetime budget on a maker that
+# cannot succeed. None disables the breaker.
+DEFAULT_MAKER_ERROR_CIRCUIT_BREAKER = 3
 
 
 @dataclass
@@ -61,11 +118,14 @@ class RunnerConfig:
     run_log_path: Optional[Path] = None
     poll_interval_seconds: float = 60.0
     max_cycles: Optional[int] = None  # None => run until governance stops it
+    maker_preflight: Optional[MakerPreflight] = None
+    maker_error_circuit_breaker: Optional[int] = DEFAULT_MAKER_ERROR_CIRCUIT_BREAKER
 
 
 @dataclass
 class CycleResult:
-    outcome: str  # paused | expired | no-op | fix-proposed | escalated | error
+    # paused | expired | no-op | fix-proposed | escalated | error | maker-error | blocked
+    outcome: str
     detail: str = ""
     task_id: Optional[str] = None
     verdict: Optional[str] = None
@@ -215,6 +275,39 @@ def run_cycle(cfg: RunnerConfig) -> CycleResult:
         )
         return CycleResult(outcome, reasoning, task_id=task_id, verdict=verdict)
 
+    except MakerAuthError as exc:
+        # The maker did not actually run: it could not authenticate. This is NOT a
+        # no-op (the maker never got to decide anything) and NOT a generic runner
+        # error (it is an operator-actionable, named failure mode) — it gets its own
+        # outcome, "blocked", with the real stderr carried into the run-log.
+        stderr = (exc.stderr or str(exc)).strip()[:2000]
+        _append_run_log(
+            cfg,
+            outcome="blocked",
+            items_found=1,
+            last_progress=f"{task_id}: maker could not authenticate - {stderr[:200]}",
+            actions=[f"maker auth error: {stderr}"],
+            escalations=[
+                f"{task_id}: maker cannot authenticate — operator must re-authenticate "
+                f"the maker before this loop can do anything. Detail: {stderr[:300]}"
+            ],
+        )
+        return CycleResult("blocked", stderr, task_id=task_id)
+
+    except MakerError as exc:
+        # The maker ran but failed (non-zero exit, crash, missing binary) — never
+        # record this as a no-op. Distinct outcome, real stderr in the run-log.
+        stderr = (exc.stderr or str(exc)).strip()[:2000]
+        _append_run_log(
+            cfg,
+            outcome="maker-error",
+            items_found=1,
+            last_progress=f"{task_id}: maker failed to run - {stderr[:200]}",
+            actions=[f"maker error: {stderr}"],
+            escalations=[f"{task_id}: maker failed to run - {stderr[:300]}"],
+        )
+        return CycleResult("maker-error", stderr, task_id=task_id)
+
     except Exception as exc:  # honest failure — never a silent success
         _append_run_log(
             cfg,
@@ -233,16 +326,94 @@ def run_cycle(cfg: RunnerConfig) -> CycleResult:
         lifetime.tick(cfg.loop_id, int(time.monotonic() - started))
 
 
+def maker_preflight_gate(cfg: RunnerConfig) -> Optional[CycleResult]:
+    """Run the configured maker pre-flight once, before any cycle runs.
+
+    Returns None when there is no pre-flight configured, or it passed — the caller
+    should proceed. Returns an already-logged ``blocked`` CycleResult when it failed,
+    so a loop refuses to start rather than spending its lifetime budget (and popping
+    tasks off the queue) on cycles that cannot possibly succeed. Deliberately does
+    NOT touch the lifetime counter and does NOT call the task source.
+    """
+    if cfg.maker_preflight is None:
+        return None
+    result = cfg.maker_preflight()
+    if result.ok:
+        return None
+    hint = f" {result.hint}" if result.hint else ""
+    detail = f"{result.detail}.{hint}".strip()
+    _append_run_log(
+        cfg,
+        outcome="blocked",
+        items_found=0,
+        last_progress=f"maker pre-flight failed: {result.detail}",
+        actions=[f"pre-flight: {result.detail}"],
+        escalations=[f"maker cannot run - {detail}"],
+    )
+    return CycleResult("blocked", detail)
+
+
+def _is_maker_failure(outcome: str) -> bool:
+    return outcome in ("maker-error", "blocked")
+
+
 def run(cfg: RunnerConfig) -> list[CycleResult]:
-    """Run cycles until governance stops the loop (paused / expired) or max_cycles."""
+    """Run cycles until governance stops the loop (paused / expired) or max_cycles.
+
+    Pre-flights the maker once before the first cycle (see `maker_preflight_gate`),
+    and acts as a circuit breaker: `cfg.maker_error_circuit_breaker` consecutive
+    maker-error/blocked outcomes self-pause the loop (touch the kill-switch) instead
+    of grinding through the rest of the lifetime budget on a maker that cannot run.
+    """
+    gate = maker_preflight_gate(cfg)
+    if gate is not None:
+        return [gate]
+
     results: list[CycleResult] = []
     cycle = 0
+    consecutive_maker_failures = 0
     while cfg.max_cycles is None or cycle < cfg.max_cycles:
         result = run_cycle(cfg)
         results.append(result)
         cycle += 1
+
+        if _is_maker_failure(result.outcome):
+            consecutive_maker_failures += 1
+        else:
+            consecutive_maker_failures = 0
+
         if result.outcome in ("paused", "expired"):
             break
+
+        if (
+            cfg.maker_error_circuit_breaker is not None
+            and consecutive_maker_failures >= cfg.maker_error_circuit_breaker
+        ):
+            kill_switch_path(cfg.loop_id).touch()
+            breaker_detail = (
+                f"circuit breaker: {consecutive_maker_failures} consecutive maker "
+                "failures; self-paused"
+            )
+            _append_run_log(
+                cfg,
+                outcome="paused",
+                items_found=0,
+                last_progress=breaker_detail,
+                actions=[
+                    f"circuit breaker tripped after {consecutive_maker_failures} "
+                    "consecutive maker-error/blocked outcomes"
+                ],
+                escalations=[
+                    "maker failed repeatedly; loop self-paused (kill-switch set). "
+                    "Check the maker (auth, PATH, model) before clearing it."
+                ],
+            )
+            # Record the trip as its own result so a caller inspecting results[-1]
+            # (e.g. the CLI's multi-cycle summary) sees "paused", not a stale
+            # maker-error, as the reason the loop stopped.
+            results.append(CycleResult("paused", breaker_detail))
+            break
+
         if cfg.poll_interval_seconds > 0:
             time.sleep(cfg.poll_interval_seconds)
     return results
@@ -286,18 +457,166 @@ def _build_prompt(task: dict) -> str:
     )
 
 
-def cursor_agent_maker(model: str = "composer-2.5", *, timeout: int = 900) -> Maker:
-    """Default maker: shell out to cursor-agent (sanctioned, QB-routed)."""
+# Phrases that show up in a CLI agent's stderr/stdout when it could not authenticate.
+# Deliberately textual and specific (never a bare status code) to keep false positives
+# low: matching too eagerly would mislabel a real crash as an auth problem.
+_AUTH_ERROR_MARKERS: tuple[str, ...] = (
+    "authentication required",
+    "not logged in",
+    "agent login",
+    "cursor_api_key",
+    "api key is invalid",
+    "invalid api key",
+    "unauthorized",
+    "please authenticate",
+    "please log in",
+    "please run 'login'",
+)
+
+
+def _looks_like_auth_error(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _AUTH_ERROR_MARKERS)
+
+
+def cli_agent_maker(
+    argv_prefix: list[str],
+    *,
+    timeout: int = 900,
+) -> Maker:
+    """Build a Maker from any CLI tool shaped like ``<cmd> [flags...] <prompt>``.
+
+    This is the pluggable seam: a maker is "given a task instruction and a repo,
+    produce a diff", and a large class of agentic CLIs (cursor-agent, and others with
+    the same "flags then a trailing prompt string, edits the cwd, prints a summary"
+    shape) fit it directly. `cursor_agent_maker` below is just the default instance of
+    this shape; a consumer can configure a different CLI-based maker by calling this
+    directly (or via `coco-loops run --maker-cmd "..."`) and passing the result as
+    `RunnerConfig.maker`, with no change to the runner's governance logic.
+
+    Never swallows a failure into a stringified "summary" the way the old cursor-agent
+    maker did: a missing binary, non-zero exit, or timeout raises `MakerError` (or the
+    more specific `MakerAuthError` when the output looks like an auth failure) so
+    `run_cycle` can log a distinct outcome instead of a false "no-op".
+    """
 
     def _maker(task: dict, repo: Path) -> str:
+        argv = [*argv_prefix, _build_prompt(task)]
+        try:
+            proc = subprocess.run(
+                argv, cwd=str(repo), capture_output=True, text=True, timeout=timeout
+            )
+        except FileNotFoundError as exc:
+            raise MakerError(
+                f"maker binary not found on PATH: {argv[0]!r} ({exc})", stderr=str(exc)
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise MakerError(
+                f"maker timed out after {timeout}s running: {' '.join(argv[:-1])}",
+                stderr=str(exc),
+            ) from exc
+
+        if proc.returncode != 0:
+            stderr = (proc.stderr or proc.stdout or "").strip()
+            message = f"{argv[0]} exited {proc.returncode}: {stderr[:500] or '(no output)'}"
+            if _looks_like_auth_error(stderr) or _looks_like_auth_error(proc.stdout or ""):
+                raise MakerAuthError(message, returncode=proc.returncode, stderr=stderr)
+            raise MakerError(message, returncode=proc.returncode, stderr=stderr)
+
+        out = (proc.stdout or proc.stderr or f"{argv[0]} produced no output").strip()
+        return out[:500]
+
+    return _maker
+
+
+def cursor_agent_maker(model: str = "composer-2.5", *, timeout: int = 900) -> Maker:
+    """Default maker: shell out to cursor-agent (sanctioned, QB-routed).
+
+    A thin specialization of `cli_agent_maker` for cursor-agent's flags; behavior on
+    success is unchanged from before. On failure it now raises instead of returning
+    the error text as if it were a legitimate maker summary.
+    """
+    return cli_agent_maker(
+        ["cursor-agent", "-p", "--yolo", "--trust", "--model", model], timeout=timeout
+    )
+
+
+_CURSOR_AGENT_LOGIN_HINT = (
+    "Fix: run `cursor-agent login` (or set CURSOR_API_KEY), then re-arm the loop."
+)
+
+
+def generic_binary_preflight(binary: str) -> PreflightResult:
+    """Cheapest possible probe for an arbitrary CLI-based maker: is it on PATH?
+
+    Used for a custom `--maker-cmd` maker, where the framework has no way to know
+    that CLI's specific status/auth subcommand. This is intentionally weaker than
+    `cursor_agent_preflight` (PATH presence only, no auth check) — see the module
+    docstring: a full generic auth probe was judged too tool-specific to build safely
+    for an unknown CLI, so this checks the one thing that generalizes.
+    """
+    if shutil.which(binary) is None:
+        return PreflightResult(
+            ok=False,
+            detail=f"maker binary not found on PATH: {binary!r}",
+            hint="Install it or fix PATH, then re-arm the loop.",
+        )
+    return PreflightResult(ok=True, detail=f"{binary} found on PATH (auth not probed)")
+
+
+def cursor_agent_preflight(*, timeout: int = 15) -> PreflightResult:
+    """Cheapest possible probe: is cursor-agent on PATH and authenticated?
+
+    Uses ``cursor-agent status --format json`` — a lightweight status/whoami call,
+    not a real generation request — so a lapsed login is caught before any lifetime
+    budget or task-queue entry is spent on cycles that cannot succeed.
+    """
+    try:
         proc = subprocess.run(
-            ["cursor-agent", "-p", "--yolo", "--trust", "--model", model, _build_prompt(task)],
-            cwd=str(repo),
+            ["cursor-agent", "status", "--format", "json"],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
-        out = (proc.stdout or proc.stderr or "cursor-agent produced no output").strip()
-        return out[:500]
+    except FileNotFoundError:
+        return PreflightResult(
+            ok=False,
+            detail="cursor-agent is not on PATH",
+            hint="Install cursor-agent and ensure it is on PATH.",
+        )
+    except subprocess.TimeoutExpired:
+        return PreflightResult(
+            ok=False,
+            detail=f"cursor-agent status did not respond within {timeout}s",
+            hint="Check the cursor-agent installation/network and retry.",
+        )
 
-    return _maker
+    raw = (proc.stdout or proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return PreflightResult(
+            ok=False,
+            detail=f"cursor-agent status exited {proc.returncode}: {raw[:300]}",
+            hint=_CURSOR_AGENT_LOGIN_HINT,
+        )
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        # Unexpected output shape from a future cursor-agent version: fall back to a
+        # text scan rather than blocking a loop on a parsing quirk.
+        if _looks_like_auth_error(raw):
+            return PreflightResult(ok=False, detail=raw[:300], hint=_CURSOR_AGENT_LOGIN_HINT)
+        return PreflightResult(
+            ok=True, detail="cursor-agent status: unparsed output, no auth-error text found"
+        )
+
+    if payload.get("isAuthenticated") is False:
+        return PreflightResult(
+            ok=False,
+            detail=str(payload.get("message") or "cursor-agent is not authenticated"),
+            hint=_CURSOR_AGENT_LOGIN_HINT,
+        )
+
+    return PreflightResult(
+        ok=True, detail=str(payload.get("message") or "cursor-agent authenticated")
+    )

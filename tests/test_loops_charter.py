@@ -10,9 +10,11 @@ import pytest
 
 from coco_loops import charter as charter_mod
 from coco_loops import lifetime
+from coco_loops import runner as runner_mod
 from coco_loops.charter import Charter, CharterError
 from coco_loops.cli import infer_level, main
 from coco_loops.paths import reset_config
+from coco_loops.runner import PreflightResult
 
 
 def _valid_dict() -> dict:
@@ -188,6 +190,15 @@ class TestCharterCli:
     def test_install_via_cli_writes_and_arms(self, charter_env, capsys, monkeypatch):
         charter_file = charter_env["loops_dir"].parent / "charter.json"
         charter_file.write_text(json.dumps(_valid_dict()), encoding="utf-8")
+
+        # --install now also warns (stderr only, does not block) on a broken default
+        # maker pre-flight; stub it so this test never shells out to a real
+        # cursor-agent process.
+        monkeypatch.setattr(
+            runner_mod,
+            "cursor_agent_preflight",
+            lambda: PreflightResult(ok=True, detail="stub: skipped in test"),
+        )
 
         rc = main(["charter", "--from-json", str(charter_file), "--install"])
         out = capsys.readouterr().out

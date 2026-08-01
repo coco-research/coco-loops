@@ -122,6 +122,20 @@ has the verifier judge it, logs the proposal, and reverts the tree. Use `--once`
 a single cycle first and watch what it does. Recommend a dedicated worktree so the
 loop's revert can never touch the person's uncommitted work.
 
+Before the first cycle, `coco-loops run` pre-flights the maker (a cheap `cursor-agent
+status` check, not a real generation call) and refuses to start — spending no lifetime
+budget — if it cannot authenticate. If you see the run refuse with `blocked`, the fix is
+almost always `cursor-agent login`; do not diagnose it as a task-quality problem.
+
+If a cycle instead reports `no-op`, that means the maker genuinely ran and decided
+there was nothing to change (vague tasks produce these). A cycle that could not run at
+all — a crash, a missing binary, or an auth failure mid-run — reports `maker-error` or
+`blocked` instead, carrying the real stderr in the run-log, and never a bare `no-op`.
+Read `coco-loops status <loop_id>` when you see either and treat them differently: a
+`no-op` streak means sharpen the tasks; a `maker-error`/`blocked` streak means fix the
+maker, not the tasks. Three consecutive maker failures self-pause the loop (kill-switch
+set) rather than grinding through the rest of its lifetime.
+
 ### 6. Monitor and hand back
 
 ```
