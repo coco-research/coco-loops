@@ -36,11 +36,13 @@ lifetime budget on cycles that cannot possibly succeed.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -120,6 +122,14 @@ class RunnerConfig:
     max_cycles: Optional[int] = None  # None => run until governance stops it
     maker_preflight: Optional[MakerPreflight] = None
     maker_error_circuit_breaker: Optional[int] = DEFAULT_MAKER_ERROR_CIRCUIT_BREAKER
+    # Called with the task dict when a cycle ends without judging it, so the task goes
+    # back to the queue instead of being silently spent. Without this, running with a
+    # broken maker drains the whole queue while doing no work, and an operator who then
+    # fixes the maker restarts against an empty queue and concludes the work is done.
+    requeue: Optional[Callable[[dict], None]] = None
+    # Where to persist each cycle's proposed diff. A propose-only loop whose proposals are
+    # discarded has no output at all, so this defaults to being written next to the run-log.
+    proposals_dir: Optional[Path] = None
 
 
 @dataclass
@@ -129,6 +139,52 @@ class CycleResult:
     detail: str = ""
     task_id: Optional[str] = None
     verdict: Optional[str] = None
+    # Path to the saved diff, when the cycle produced one. Lets a caller review the batch
+    # of proposals without re-reading the run-log.
+    proposal_path: Optional[str] = None
+
+
+def _requeue(cfg: "RunnerConfig", task: Optional[dict], outcome: str) -> None:
+    """Return an unjudged task to the queue.
+
+    A cycle that ended in blocked, maker-error or error never got a verdict on the task,
+    so consuming it would lose real work silently. Requeue failures are swallowed on
+    purpose: the cycle has already failed and its outcome is already in the run-log, so
+    raising here would replace an honest failure with a confusing one.
+    """
+    if task is None or cfg.requeue is None:
+        return
+    try:
+        cfg.requeue(task)
+    except Exception:
+        pass
+
+
+def _save_proposal(cfg: "RunnerConfig", task_id: str, diff: str, verdict: str) -> Optional[Path]:
+    """Persist a cycle's diff so a propose-only run leaves something to review.
+
+    The tree is reverted after every cycle, so a diff held only in memory is gone. That
+    made REJECT verdicts produce no artifact at all, which defeats the point of a
+    propose-only loop: there was no batch of proposals for the human to review. Written
+    for every verdict, because a rejected proposal is often still informative.
+    """
+    if not diff:
+        return None
+    base = cfg.proposals_dir
+    if base is None:
+        anchor = cfg.run_log_path.parent if cfg.run_log_path else cfg.repo
+        base = Path(anchor) / "proposals"
+    try:
+        base = Path(base)
+        base.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", task_id)[:60] or "task"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        out = base / f"{stamp}-{safe}-{verdict.lower()}.patch"
+        out.write_text(diff, encoding="utf-8")
+        return out
+    except Exception:
+        # Never let artifact bookkeeping turn a real proposal into a cycle failure.
+        return None
 
 
 # --- git helpers: capture the maker's change, then discard it (propose-only) ---
@@ -261,19 +317,30 @@ def run_cycle(cfg: RunnerConfig) -> CycleResult:
             # APPROVE and REJECT are both logged as proposals at L1 (never committed).
             outcome = "fix-proposed"
 
+        # Persist the diff BEFORE the finally-block revert throws the working tree away.
+        # This is the only durable output of a propose-only cycle.
+        saved = _save_proposal(cfg, task_id, diff, verdict)
+
+        actions = [
+            f"maker: {summary}",
+            f"verifier: {verdict}",
+            f"files: {', '.join(files_changed[:10])}",
+        ]
+        if saved:
+            actions.append(f"proposal saved: {saved}")
+
         _append_run_log(
             cfg,
             outcome=outcome,
             items_found=1,
             last_progress=f"{task_id}: {verdict} (propose-only, not committed)",
-            actions=[
-                f"maker: {summary}",
-                f"verifier: {verdict}",
-                f"files: {', '.join(files_changed[:10])}",
-            ],
+            actions=actions,
             escalations=escalations,
         )
-        return CycleResult(outcome, reasoning, task_id=task_id, verdict=verdict)
+        return CycleResult(
+            outcome, reasoning, task_id=task_id, verdict=verdict,
+            proposal_path=str(saved) if saved else None,
+        )
 
     except MakerAuthError as exc:
         # The maker did not actually run: it could not authenticate. This is NOT a
@@ -292,6 +359,7 @@ def run_cycle(cfg: RunnerConfig) -> CycleResult:
                 f"the maker before this loop can do anything. Detail: {stderr[:300]}"
             ],
         )
+        _requeue(cfg, task, "blocked")
         return CycleResult("blocked", stderr, task_id=task_id)
 
     except MakerError as exc:
@@ -306,6 +374,7 @@ def run_cycle(cfg: RunnerConfig) -> CycleResult:
             actions=[f"maker error: {stderr}"],
             escalations=[f"{task_id}: maker failed to run - {stderr[:300]}"],
         )
+        _requeue(cfg, task, "maker-error")
         return CycleResult("maker-error", stderr, task_id=task_id)
 
     except Exception as exc:  # honest failure — never a silent success
@@ -317,6 +386,7 @@ def run_cycle(cfg: RunnerConfig) -> CycleResult:
             actions=[f"error: {exc}"],
             escalations=[f"{task_id}: cycle error {exc}"],
         )
+        _requeue(cfg, task, "error")
         return CycleResult("error", str(exc), task_id=task_id)
 
     finally:
@@ -444,6 +514,32 @@ def file_task_source(path: Path) -> TaskSource:
         tmp.replace(path)
         return task if isinstance(task, dict) else None
 
+    def _requeue_task(task: dict) -> None:
+        """Put an unjudged task back at the head of the queue.
+
+        Wire this to RunnerConfig.requeue. Without it, a cycle that never reached a
+        verdict still spends the task, so a run against a broken maker empties the queue
+        having done nothing.
+        """
+        try:
+            tasks = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        except (json.JSONDecodeError, OSError):
+            tasks = []
+        if not isinstance(tasks, list):
+            tasks = []
+        ident = task.get("id")
+        # Idempotent: never duplicate a task that is somehow already back in the queue.
+        if ident is not None and any(
+            isinstance(t, dict) and t.get("id") == ident for t in tasks
+        ):
+            return
+        tasks.insert(0, task)
+        tmp = path.with_suffix(path.suffix + ".requeue.tmp")
+        tmp.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    # Attached rather than returned as a tuple so existing callers keep working.
+    _next.requeue = _requeue_task  # type: ignore[attr-defined]
     return _next
 
 
