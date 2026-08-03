@@ -1,6 +1,6 @@
 # Coding-Loop Agentic Contract
 
-**McKinsey-internal.** Registry entry for the CoCo **coding-loop** — the first loop closed end-to-end under the loop framework (Phase P1).
+Registry entry for the CoCo **coding-loop** — the first loop closed end-to-end under the loop framework (Phase P1).
 
 **Inherits:** [loop-constitution.md](./loop-constitution.md) (Layer 0, immutable)
 

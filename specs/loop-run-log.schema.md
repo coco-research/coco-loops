@@ -1,6 +1,6 @@
 # Loop Run-Log Schema (E — audit + heartbeat)
 
-**McKinsey-internal.** Append-only audit trail: one JSON object per cycle per loop. Feeds escalation (**E**), promotion gate FP-rate (T8), and supervisor liveness (T9 `last_progress`).
+Append-only audit trail: one JSON object per cycle per loop. Feeds escalation (**E**), promotion gate FP-rate (T8), and supervisor liveness (T9 `last_progress`).
 
 **Storage (runtime):** `~/.coco/loop-run-log.jsonl` (append-only JSONL) or equivalent; canonical schema defined here in `loops/`.
 

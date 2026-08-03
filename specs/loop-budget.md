@@ -1,6 +1,6 @@
 # Loop Budget (Π)
 
-**McKinsey-internal.** Cost caps, on-exceed behavior, and kill switch for CoCo loops.
+Cost caps, on-exceed behavior, and kill switch for CoCo loops.
 
 **Component:** `Π` (Permissions / budget) in `C = ⟨O, K, I, Y, Φ, A, Π, E⟩`
 

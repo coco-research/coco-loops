@@ -1,6 +1,6 @@
 # Loop Constitution (Layer 0 — Immutable)
 
-**McKinsey-internal.** This document defines invariants that **every** CoCo loop inherits. No loop, skill, daemon, or self-evolution cycle may edit, disable, or bypass these rules. Self-evolution may **propose** a change; only a **human** may ratify an amendment to this file.
+This document defines invariants that **every** CoCo loop inherits. No loop, skill, daemon, or self-evolution cycle may edit, disable, or bypass these rules. Self-evolution may **propose** a change; only a **human** may ratify an amendment to this file.
 
 **Status:** Immutable floor. Promoted from advisory `brain_principles` to **enforced** governance (Phase P1, T0b).
 
@@ -24,7 +24,7 @@ Each invariant is phrased so an automated gate (verifier, CI, or pre-commit hook
 
 ### I3 — Sovereignty: no raw public cloud for content
 
-**Predicate:** No loop SHALL send organizational, client, or McKinsey-sensitive **content** to unsanctioned public-cloud LLM endpoints (`api.openai.com`, `api.anthropic.com`, or equivalent direct egress). Permitted paths: **local/MLX**, **QuantumBlack AI Gateway** (`*.prod.ai-gateway.quantumblack.com`), and other explicitly allowlisted sanctioned backends per project RESUME STATE.
+**Predicate:** No loop SHALL send organizational, client, or otherwise sensitive **content** to unsanctioned public-cloud LLM endpoints (`api.openai.com`, `api.anthropic.com`, or equivalent direct egress). Permitted paths: **local/MLX**, **a sanctioned enterprise AI gateway**, and other explicitly allowlisted sanctioned backends per project RESUME STATE.
 
 **Gate check:** Code or config introduces a call to a non-allowlisted host for content generation/embeddings on sensitive payloads → **REJECT**. (Host allowlist enforced by sovereignty guard + verifier review.)
 

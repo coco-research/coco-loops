@@ -19,7 +19,7 @@ Safety design:
 
 This module is stdlib-only (subprocess is stdlib, like the verifier's own test
 runner). The default maker shells out to `cursor-agent`, which is sanctioned and
-routes through the QuantumBlack gateway, satisfying constitution I3. A different
+routes through a sanctioned enterprise gateway, satisfying constitution I3. A different
 maker can be injected; tests inject a fake.
 
 Maker failure vs. genuine no-op: a maker that legitimately ran and decided there was

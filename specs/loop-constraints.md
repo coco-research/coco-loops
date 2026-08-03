@@ -1,6 +1,6 @@
 # Loop Constraints (Φ)
 
-**McKinsey-internal.** Per-loop constraints read **pre-flight every cycle** (after kill-switch check, before triage or action). Inherits [loop-constitution.md](./loop-constitution.md) (Layer 0).
+Per-loop constraints read **pre-flight every cycle** (after kill-switch check, before triage or action). Inherits [loop-constitution.md](./loop-constitution.md) (Layer 0).
 
 **Component:** `Φ` in `C = ⟨O, K, I, Y, Φ, A, Π, E⟩`
 
@@ -73,7 +73,7 @@ Then: log run-log `outcome: no-op`, minimal token spend (target **<5k tokens**),
 
 ## Rule 5 — Sovereignty (content egress)
 
-**MUST NOT** send sensitive/org content to unsanctioned public-cloud LLM endpoints (Constitution I3). Permitted: local/MLX, QuantumBlack AI Gateway, RESUME STATE allowlist.
+**MUST NOT** send sensitive/org content to unsanctioned public-cloud LLM endpoints (Constitution I3). Permitted: local/MLX, a sanctioned enterprise AI gateway, RESUME STATE allowlist.
 
 Verifier checks outbound hosts on any LLM call in the cycle.
 
