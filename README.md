@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/license-proprietary%20(source--available)-8B5CF6?style=for-the-badge" alt="License">
+  <img src="https://img.shields.io/badge/license-MIT-8B5CF6?style=for-the-badge" alt="License: MIT">
   <img src="https://img.shields.io/badge/python-3.10%2B-4C8DFF?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/runtime%20deps-0%20(stdlib--only)-22C55E?style=for-the-badge" alt="Zero runtime deps">
   <img src="https://img.shields.io/badge/part%20of-CoCo%20Research-0f1d3a?style=for-the-badge" alt="Part of CoCo Research">
@@ -151,6 +151,6 @@ tests/               framework tests
 
 ## License
 
-**Proprietary — source-available.** Copyright © 2026 Coco Inc (coco-research). All rights reserved. The source is public for reference; running it locally is permitted, but use, copying, modification, and redistribution require a written agreement. See [LICENSE](LICENSE).
+MIT. Copyright (c) 2026 Coco Research. See [LICENSE](LICENSE).
 
 <sub>Part of <a href="https://github.com/coco-research/coco">CoCo Research</a> — open-core AI orchestration &amp; agentic developer tooling.</sub>
